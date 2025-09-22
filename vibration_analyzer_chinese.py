@@ -154,8 +154,8 @@ class VibrAnalyzer:
 
     def __init__(self, root):
         self.root = root
-        self.root.title("专业振动分析仪 v3.0 - 真实数据显示")
-        self.root.geometry("1400x900")  # 增大窗口以容纳新的显示区域
+        self.root.title("专业振动分析仪 v3.1 - 频域+时域同步显示")
+        self.root.geometry("1400x1000")  # 增大窗口高度以容纳两个图表
 
         # 数据相关
         self.serial_conn = None
@@ -275,19 +275,19 @@ class VibrAnalyzer:
         ttk.Button(quick_frame, text="大振动(0-1g)", 
                   command=lambda: self.set_quick_scale(0, 1.0)).pack(side=tk.LEFT, padx=2)
         
-        # 图表框架 - 使用Notebook来分页显示
-        notebook = ttk.Notebook(main_frame)
-        notebook.pack(fill=tk.BOTH, expand=True, pady=(5, 0))
+        # 图表框架 - 同一界面显示两个图表
+        plot_main_frame = ttk.Frame(main_frame)
+        plot_main_frame.pack(fill=tk.BOTH, expand=True, pady=(5, 0))
 
-        # 频域分析页面
-        freq_frame = ttk.Frame(notebook)
-        notebook.add(freq_frame, text="频域分析")
-        self.plot_container = freq_frame
+        # 频域分析图表框架 (上半部分)
+        freq_label_frame = ttk.LabelFrame(plot_main_frame, text="频域分析 - 振动频谱", padding=2)
+        freq_label_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 3))
+        self.plot_container = freq_label_frame
 
-        # 原始数据页面
-        raw_frame = ttk.Frame(notebook)
-        notebook.add(raw_frame, text="原始加速度数据")
-        self.raw_plot_container = raw_frame
+        # 原始数据图表框架 (下半部分)
+        raw_label_frame = ttk.LabelFrame(plot_main_frame, text="时域分析 - 三轴加速度实时波形", padding=2)
+        raw_label_frame.pack(fill=tk.BOTH, expand=True, pady=(3, 0))
+        self.raw_plot_container = raw_label_frame
         
         # 状态栏
         status_frame = ttk.Frame(main_frame)
@@ -308,9 +308,10 @@ class VibrAnalyzer:
         
     def setup_plot(self):
         """设置绘图"""
-        # 频域分析图表
-        self.fig = Figure(figsize=(10, 6), dpi=100)
+        # 频域分析图表 (上半部分)
+        self.fig = Figure(figsize=(12, 4.5), dpi=100)
         self.ax = self.fig.add_subplot(111)
+        self.fig.tight_layout(pad=2.0)
 
         self.canvas = FigureCanvasTkAgg(self.fig, self.plot_container)
         self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
@@ -325,9 +326,10 @@ class VibrAnalyzer:
 
         self.canvas.draw()
 
-        # 原始数据图表
-        self.raw_fig = Figure(figsize=(10, 6), dpi=100)
+        # 原始数据图表 (下半部分)
+        self.raw_fig = Figure(figsize=(12, 4.5), dpi=100)
         self.raw_ax = self.raw_fig.add_subplot(111)
+        self.raw_fig.tight_layout(pad=2.0)
 
         self.raw_canvas = FigureCanvasTkAgg(self.raw_fig, self.raw_plot_container)
         self.raw_canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
@@ -335,7 +337,7 @@ class VibrAnalyzer:
         # 初始化原始数据图
         self.raw_ax.set_xlabel('时间 (s)')
         self.raw_ax.set_ylabel('加速度 (g)')
-        self.raw_ax.set_title('实时原始加速度数据')
+        self.raw_ax.set_title('三轴加速度实时波形 (最近10秒)')
         self.raw_ax.grid(True, alpha=0.3)
         self.raw_ax.legend(['X轴', 'Y轴', 'Z轴'])
 
