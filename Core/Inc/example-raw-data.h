@@ -20,6 +20,7 @@
 #include "Iim423xxTransport.h"
 #include "Iim423xxDefs.h"
 #include "Iim423xxDriver_HL.h"
+#include "arm_math.h"  // For float32_t
 
 
 /**
@@ -70,8 +71,8 @@ int GetDataFromInvDevice(void);
 /**
  * \brief This function is the custom handling packet function.
  *
- * It is passed in parameter at driver init time and it is called by 
- * inv_iim423xx_get_data_from_fifo function each time a new valid packet is extracted 
+ * It is passed in parameter at driver init time and it is called by
+ * inv_iim423xx_get_data_from_fifo function each time a new valid packet is extracted
  * from FIFO.
  * In this implementation, function extends packet timestamp from 16 to 64 bits and then
  * process data from packet and print them on UART.
@@ -79,6 +80,18 @@ int GetDataFromInvDevice(void);
  * \param[in] event structure containing sensor data from one packet
  */
 void HandleInvDeviceFifoPacket(inv_iim423xx_sensor_event_t * event);
+
+/**
+ * \brief Send raw accelerometer data via protocol
+ *
+ * This function sends raw accelerometer data (X, Y, Z axes) to the host computer
+ * using a custom protocol format.
+ *
+ * \param[in] accel_x X-axis acceleration in g units
+ * \param[in] accel_y Y-axis acceleration in g units
+ * \param[in] accel_z Z-axis acceleration in g units
+ */
+void Send_Raw_Accel_Data(float32_t accel_x, float32_t accel_y, float32_t accel_z);
 
 
 #endif /* !_EXAMPLE_RAW_AG_H_ */

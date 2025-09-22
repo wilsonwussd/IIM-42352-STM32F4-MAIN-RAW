@@ -97,13 +97,13 @@ class ProtocolParser:
             if cmd == 0x01 and len(payload) >= 88:  # 21点数据
                 timestamp = struct.unpack('<I', payload[:4])[0]
                 magnitudes = []
-                
+
                 for i in range(4, 88, 4):
                     mag = struct.unpack('<f', payload[i:i+4])[0]
                     magnitudes.append(mag)  # 保持原始数据
-                
+
                 frequencies = [i * 25.0 for i in range(21)]
-                
+
                 return {
                     'type': 'spectrum',
                     'timestamp': timestamp,
@@ -111,17 +111,17 @@ class ProtocolParser:
                     'magnitudes': magnitudes,
                     'data_points': 21
                 }
-                
+
             elif cmd == 0x04 and len(payload) >= 1032:  # 257点数据
                 timestamp = struct.unpack('<I', payload[:4])[0]
                 magnitudes = []
-                
+
                 for i in range(4, 1032, 4):
                     mag = struct.unpack('<f', payload[i:i+4])[0]
                     magnitudes.append(mag)  # 保持原始数据
-                
+
                 frequencies = [i * 1000.0 / 512 for i in range(257)]
-                
+
                 return {
                     'type': 'spectrum_full',
                     'timestamp': timestamp,
@@ -129,27 +129,49 @@ class ProtocolParser:
                     'magnitudes': magnitudes,
                     'data_points': 257
                 }
-                
+
+            elif cmd == 0x02 and len(payload) >= 16:  # 原始加速度数据
+                timestamp = struct.unpack('<I', payload[:4])[0]
+                accel_x = struct.unpack('<f', payload[4:8])[0]
+                accel_y = struct.unpack('<f', payload[8:12])[0]
+                accel_z = struct.unpack('<f', payload[12:16])[0]
+
+                return {
+                    'type': 'raw_accel',
+                    'timestamp': timestamp,
+                    'accel_x': accel_x,
+                    'accel_y': accel_y,
+                    'accel_z': accel_z
+                }
+
         except Exception:
             pass
-        
+
         return None
 
 class VibrAnalyzer:
     """振动分析仪主类"""
-    
+
     def __init__(self, root):
         self.root = root
         self.root.title("专业振动分析仪 v3.0 - 真实数据显示")
-        self.root.geometry("1200x800")
-        
+        self.root.geometry("1400x900")  # 增大窗口以容纳新的显示区域
+
         # 数据相关
         self.serial_conn = None
         self.parser = ProtocolParser()
         self.data_queue = queue.Queue()
         self.running = False
         self.data_buffer = deque(maxlen=100)
-        
+
+        # 原始加速度数据缓存
+        self.raw_accel_buffer = {
+            'x': deque(maxlen=1000),  # 保存最近1000个点
+            'y': deque(maxlen=1000),
+            'z': deque(maxlen=1000),
+            'time': deque(maxlen=1000)
+        }
+
         # 显示控制参数
         self.y_scale_mode = tk.StringVar(value="auto")  # auto, manual, log
         self.y_min = tk.DoubleVar(value=0.0)
@@ -157,12 +179,13 @@ class VibrAnalyzer:
         self.y_unit = tk.StringVar(value="g")  # g, mg, μg
         self.show_grid = tk.BooleanVar(value=True)
         self.show_peak_labels = tk.BooleanVar(value=True)
-        
+        self.show_raw_data = tk.BooleanVar(value=True)  # 是否显示原始数据
+
         # 统计信息
         self.frame_count = 0
         self.update_rate = 0.0
         self.last_update_time = time.time()
-        
+
         self.setup_ui()
         self.setup_plot()
         
@@ -235,6 +258,8 @@ class VibrAnalyzer:
                        command=self.update_plot_settings).pack(side=tk.LEFT, padx=(20, 5))
         ttk.Checkbutton(options_frame, text="显示峰值标注", variable=self.show_peak_labels,
                        command=self.update_plot_settings).pack(side=tk.LEFT, padx=5)
+        ttk.Checkbutton(options_frame, text="显示原始数据", variable=self.show_raw_data,
+                       command=self.update_plot_settings).pack(side=tk.LEFT, padx=5)
         
         # 快速缩放按钮
         quick_frame = ttk.Frame(y_control_frame)
@@ -250,39 +275,71 @@ class VibrAnalyzer:
         ttk.Button(quick_frame, text="大振动(0-1g)", 
                   command=lambda: self.set_quick_scale(0, 1.0)).pack(side=tk.LEFT, padx=2)
         
-        # 图表框架
-        plot_frame = ttk.LabelFrame(main_frame, text="频域分析", padding=5)
-        plot_frame.pack(fill=tk.BOTH, expand=True)
-        
-        self.plot_container = plot_frame
+        # 图表框架 - 使用Notebook来分页显示
+        notebook = ttk.Notebook(main_frame)
+        notebook.pack(fill=tk.BOTH, expand=True, pady=(5, 0))
+
+        # 频域分析页面
+        freq_frame = ttk.Frame(notebook)
+        notebook.add(freq_frame, text="频域分析")
+        self.plot_container = freq_frame
+
+        # 原始数据页面
+        raw_frame = ttk.Frame(notebook)
+        notebook.add(raw_frame, text="原始加速度数据")
+        self.raw_plot_container = raw_frame
         
         # 状态栏
         status_frame = ttk.Frame(main_frame)
         status_frame.pack(fill=tk.X, pady=(5, 0))
-        
+
         self.info_label = ttk.Label(status_frame, text="更新频率: 0.0 Hz | 接收数据: 0 | 峰值频率: -- Hz | 峰值幅度: -- | 最大值: --")
         self.info_label.pack(side=tk.LEFT)
+
+        # 原始数据状态栏
+        raw_status_frame = ttk.Frame(main_frame)
+        raw_status_frame.pack(fill=tk.X, pady=(2, 0))
+
+        self.raw_info_label = ttk.Label(raw_status_frame, text="原始数据: X=-- g | Y=-- g | Z=-- g | 采样率: -- Hz")
+        self.raw_info_label.pack(side=tk.LEFT)
         
         # 刷新串口列表
         self.refresh_ports()
         
     def setup_plot(self):
         """设置绘图"""
+        # 频域分析图表
         self.fig = Figure(figsize=(10, 6), dpi=100)
         self.ax = self.fig.add_subplot(111)
-        
+
         self.canvas = FigureCanvasTkAgg(self.fig, self.plot_container)
         self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
-        
-        # 初始化空图
+
+        # 初始化频域图
         self.ax.set_xlabel('频率 (Hz)')
         self.ax.set_ylabel('幅度 (g)')
         self.ax.set_title('振动频域分析 - 真实数据显示')
         self.ax.grid(True, alpha=0.3)
         self.ax.set_xlim(0, 500)
         self.ax.set_ylim(0, 1)
-        
+
         self.canvas.draw()
+
+        # 原始数据图表
+        self.raw_fig = Figure(figsize=(10, 6), dpi=100)
+        self.raw_ax = self.raw_fig.add_subplot(111)
+
+        self.raw_canvas = FigureCanvasTkAgg(self.raw_fig, self.raw_plot_container)
+        self.raw_canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+
+        # 初始化原始数据图
+        self.raw_ax.set_xlabel('时间 (s)')
+        self.raw_ax.set_ylabel('加速度 (g)')
+        self.raw_ax.set_title('实时原始加速度数据')
+        self.raw_ax.grid(True, alpha=0.3)
+        self.raw_ax.legend(['X轴', 'Y轴', 'Z轴'])
+
+        self.raw_canvas.draw()
         
     def refresh_ports(self):
         """刷新串口列表"""
@@ -385,20 +442,23 @@ class VibrAnalyzer:
                 frame = self.data_queue.get_nowait()
                 self.data_buffer.append(frame)
                 self.frame_count += 1
-                
+
                 # 计算更新频率
                 current_time = time.time()
                 if current_time - self.last_update_time >= 1.0:
                     self.update_rate = self.frame_count / (current_time - self.last_update_time)
                     self.frame_count = 0
                     self.last_update_time = current_time
-                
-                # 更新显示
-                self.update_plot(frame)
-                
+
+                # 根据数据类型更新不同的显示
+                if frame['type'] in ['spectrum', 'spectrum_full']:
+                    self.update_plot(frame)
+                elif frame['type'] == 'raw_accel':
+                    self.update_raw_data(frame)
+
         except queue.Empty:
             pass
-        
+
         if self.running:
             self.root.after(50, self.process_data)
             
@@ -482,6 +542,76 @@ class VibrAnalyzer:
                 self.info_label.config(text=info_text)
         
         self.canvas.draw()
+
+    def update_raw_data(self, frame):
+        """更新原始加速度数据显示"""
+        if not self.show_raw_data.get():
+            return
+
+        # 添加新数据到缓存
+        current_time = time.time()
+        self.raw_accel_buffer['x'].append(frame['accel_x'])
+        self.raw_accel_buffer['y'].append(frame['accel_y'])
+        self.raw_accel_buffer['z'].append(frame['accel_z'])
+        self.raw_accel_buffer['time'].append(current_time)
+
+        # 更新原始数据图表
+        if len(self.raw_accel_buffer['time']) > 1:
+            # 计算相对时间（最近10秒）
+            times = list(self.raw_accel_buffer['time'])
+            start_time = times[-1] - 10.0  # 显示最近10秒
+
+            # 过滤数据，只显示最近10秒
+            filtered_times = []
+            filtered_x = []
+            filtered_y = []
+            filtered_z = []
+
+            for i, t in enumerate(times):
+                if t >= start_time:
+                    filtered_times.append(t - times[-1])  # 相对时间
+                    filtered_x.append(self.raw_accel_buffer['x'][i])
+                    filtered_y.append(self.raw_accel_buffer['y'][i])
+                    filtered_z.append(self.raw_accel_buffer['z'][i])
+
+            # 清除之前的绘图
+            self.raw_ax.clear()
+
+            # 绘制三轴数据
+            if filtered_times:
+                self.raw_ax.plot(filtered_times, filtered_x, 'r-', label='X轴', linewidth=1)
+                self.raw_ax.plot(filtered_times, filtered_y, 'g-', label='Y轴', linewidth=1)
+                self.raw_ax.plot(filtered_times, filtered_z, 'b-', label='Z轴', linewidth=1)
+
+            # 设置图表属性
+            self.raw_ax.set_xlabel('时间 (s)')
+            self.raw_ax.set_ylabel('加速度 (g)')
+            self.raw_ax.set_title('实时原始加速度数据 (最近10秒)')
+            self.raw_ax.grid(True, alpha=0.3)
+            self.raw_ax.legend()
+            self.raw_ax.set_xlim(-10, 0)
+
+            # 自动调整Y轴范围
+            if filtered_x or filtered_y or filtered_z:
+                all_values = filtered_x + filtered_y + filtered_z
+                if all_values:
+                    y_min = min(all_values) * 1.1
+                    y_max = max(all_values) * 1.1
+                    if abs(y_max - y_min) < 0.001:  # 避免范围太小
+                        y_center = (y_max + y_min) / 2
+                        y_min = y_center - 0.001
+                        y_max = y_center + 0.001
+                    self.raw_ax.set_ylim(y_min, y_max)
+
+            self.raw_canvas.draw()
+
+        # 更新原始数据状态信息
+        sample_rate = len(self.raw_accel_buffer['time']) / 10.0 if len(self.raw_accel_buffer['time']) > 10 else 0
+        raw_info_text = (f"原始数据: X={frame['accel_x']:.4f} g | "
+                        f"Y={frame['accel_y']:.4f} g | "
+                        f"Z={frame['accel_z']:.4f} g | "
+                        f"采样率: {sample_rate:.1f} Hz")
+        self.raw_info_label.config(text=raw_info_text)
 
 def main():
     """主函数"""

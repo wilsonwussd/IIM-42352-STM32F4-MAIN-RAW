@@ -218,28 +218,25 @@ void HandleInvDeviceFifoPacket(inv_iim423xx_sensor_event_t * event)
 	apply_mounting_matrix(icm_mounting_matrix, accel);
 
 	/*
-	 * Add accelerometer data to FFT processor
+	 * Add accelerometer data to FFT processor and send raw data
 	 * Using Z-axis (accel[2]) for vibration analysis
 	 */
 	if (event->sensor_mask & (1 << INV_IIM423XX_SENSOR_ACCEL)) {
-		// 调试信息：显示原始数据和转换后的数据
-		static uint32_t debug_count = 0;
-		debug_count++;
-		if (debug_count % 5000 == 0) {  // 每5000个样本打印一次
-			printf("DEBUG: Raw accel[2]=%d, X=%d, Y=%d\r\n", accel[2], accel[0], accel[1]);
-		}
-
 		// Convert to float and normalize (assuming 4g range, 16-bit data)
-		float32_t accel_z_g = (float32_t)accel[2] / 8192.0f; // Convert to g units
+		float32_t accel_x_g = (float32_t)accel[0] / 8192.0f; // Convert to g units
+		float32_t accel_y_g = (float32_t)accel[1] / 8192.0f;
+		float32_t accel_z_g = (float32_t)accel[2] / 8192.0f;
+
+		// Add Z-axis data to FFT processor
 		int result = FFT_AddSample(accel_z_g);
 
-		// 移除调试信息，保持输出简洁
-		// static uint32_t sample_count = 0;
-		// sample_count++;
-		// if (sample_count % 1000 == 0) {
-		//     printf("FFT: Added %lu samples, Buffer: %d%%, Z-axis: %.3f g\r\n",
-		//            sample_count, FFT_GetBufferFillPercentage(), accel_z_g);
-		// }
+		// Send raw accelerometer data every 100 samples (10Hz rate for raw data)
+		static uint32_t raw_data_counter = 0;
+		raw_data_counter++;
+		if (raw_data_counter >= 100) {  // 1000Hz / 100 = 10Hz for raw data
+			raw_data_counter = 0;
+			Send_Raw_Accel_Data(accel_x_g, accel_y_g, accel_z_g);
+		}
 	}
 
 	/*
@@ -260,7 +257,7 @@ static void apply_mounting_matrix(const int32_t matrix[9], int32_t raw[3])
 {
 	unsigned i;
 	int64_t data_q30[3];
-	
+
 	for(i = 0; i < 3; i++) {
 		data_q30[i] =  ((int64_t)matrix[3*i+0] * raw[0]);
 		data_q30[i] += ((int64_t)matrix[3*i+1] * raw[1]);
@@ -269,5 +266,78 @@ static void apply_mounting_matrix(const int32_t matrix[9], int32_t raw[3])
 	raw[0] = (int32_t)(data_q30[0]>>30);
 	raw[1] = (int32_t)(data_q30[1]>>30);
 	raw[2] = (int32_t)(data_q30[2]>>30);
+}
+
+/**
+ * @brief 发送原始加速度数据
+ * @param accel_x X轴加速度 (g)
+ * @param accel_y Y轴加速度 (g)
+ * @param accel_z Z轴加速度 (g)
+ */
+void Send_Raw_Accel_Data(float32_t accel_x, float32_t accel_y, float32_t accel_z)
+{
+    // 构建协议帧数据
+    uint8_t frame[23];  // 帧头(2) + 命令(1) + 长度(2) + 载荷(16) + 校验(1) + 帧尾(1) = 23字节
+    uint16_t index = 0;
+
+    // 帧头: AA 55
+    frame[index++] = 0xAA;
+    frame[index++] = 0x55;
+
+    // 命令码: 02 (原始加速度数据)
+    frame[index++] = 0x02;
+
+    // 载荷长度: 16字节 (4字节时间戳 + 3*4字节float32)
+    uint16_t payload_len = 16;
+    frame[index++] = (uint8_t)(payload_len & 0xFF);        // 长度低字节
+    frame[index++] = (uint8_t)((payload_len >> 8) & 0xFF); // 长度高字节
+
+    // 时间戳: 当前时间 (小端序)
+    uint32_t timestamp = HAL_GetTick();
+    frame[index++] = (uint8_t)(timestamp & 0xFF);
+    frame[index++] = (uint8_t)((timestamp >> 8) & 0xFF);
+    frame[index++] = (uint8_t)((timestamp >> 16) & 0xFF);
+    frame[index++] = (uint8_t)((timestamp >> 24) & 0xFF);
+
+    // X轴加速度数据 (小端序)
+    union {
+        float32_t f;
+        uint8_t bytes[4];
+    } float_converter;
+
+    float_converter.f = accel_x;
+    frame[index++] = float_converter.bytes[0];
+    frame[index++] = float_converter.bytes[1];
+    frame[index++] = float_converter.bytes[2];
+    frame[index++] = float_converter.bytes[3];
+
+    // Y轴加速度数据 (小端序)
+    float_converter.f = accel_y;
+    frame[index++] = float_converter.bytes[0];
+    frame[index++] = float_converter.bytes[1];
+    frame[index++] = float_converter.bytes[2];
+    frame[index++] = float_converter.bytes[3];
+
+    // Z轴加速度数据 (小端序)
+    float_converter.f = accel_z;
+    frame[index++] = float_converter.bytes[0];
+    frame[index++] = float_converter.bytes[1];
+    frame[index++] = float_converter.bytes[2];
+    frame[index++] = float_converter.bytes[3];
+
+    // 计算校验和 (命令码 + 长度 + 载荷)
+    uint8_t checksum = 0;
+    for (uint16_t i = 2; i < index; i++) {  // 从命令码开始到载荷结束
+        checksum ^= frame[i];
+    }
+    frame[index++] = checksum;
+
+    // 帧尾: 0D
+    frame[index++] = 0x0D;
+
+    // 发送协议帧
+    for (uint16_t i = 0; i < index; i++) {
+        putchar(frame[i]);
+    }
 }
 
