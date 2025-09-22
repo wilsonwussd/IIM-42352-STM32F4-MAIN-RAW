@@ -1,0 +1,6 @@
+--c99 -c --cpu Cortex-M4.fp -D__MICROLIB -g -O2 --apcs=interwork --split_sections -I ../Core/Inc -I ../Drivers/STM32F4xx_HAL_Driver/Inc -I ../Drivers/STM32F4xx_HAL_Driver/Inc/Legacy -I ../Drivers/CMSIS/Device/ST/STM32F4xx/Include -I ../Drivers/CMSIS/Include -I ..\Iim423xx -I ..\DSP_LIB\Include -I ..\LCD -I ..\sys -I ..\delay
+-IC:\Users\83176\Desktop\MAIN\MDK-ARM\RTE
+-IC:\Keil_v5\ARM\PACK\ARM\CMSIS\4.5.0\CMSIS\Include
+-IC:\Keil_v5\ARM\PACK\Keil\STM32F4xx_DFP\1.0.8\Device\Include
+-D__UVISION_VERSION="521" -D_RTE_ -DSTM32F40_41xxx -DUSE_HAL_DRIVER -DSTM32F407xx -DARDUINO -DSTM32F407xx -DARM_MATH_CM4 -D__CC_ARM -DARM_MATH_MATRIX_CH
+-o iim-42352-stm32f4\stm32f4xx_hal_flash_ramfunc.o --omf_browse iim-42352-stm32f4\stm32f4xx_hal_flash_ramfunc.crf --depend iim-42352-stm32f4\stm32f4xx_hal_flash_ramfunc.d "../Drivers/STM32F4xx_HAL_Driver/Src/stm32f4xx_hal_flash_ramfunc.c"

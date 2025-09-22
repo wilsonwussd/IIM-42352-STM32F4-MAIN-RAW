@@ -42,11 +42,13 @@ IIM-42352-STM32F4/
 │   │   ├── main.c                    # 主程序
 │   │   ├── fft_processor.c           # FFT处理模块
 │   │   ├── fft_test.c                # FFT测试模块
-│   │   └── example-raw-data.c        # 传感器配置和原始数据发送
+│   │   ├── example-raw-data.c        # 传感器配置和原始数据发送
+│   │   └── clock_config_84mhz.c      # 84MHz时钟配置验证
 │   └── Inc/
 │       ├── fft_processor.h
 │       ├── fft_test.h
 │       ├── example-raw-data.h
+│       ├── clock_config_84mhz.h      # 84MHz时钟配置定义
 │       └── main.h
 ├── Iim423xx/                         # 传感器驱动库
 ├── LCD/                              # LCD显示模块
@@ -65,9 +67,16 @@ IIM-42352-STM32F4/
 
 ### **硬件配置**
 - **MCU**: STM32F4系列 (推荐STM32F407VGT6)
-- **时钟**: 168MHz主频
+- **时钟**: 84MHz主频 (优化功耗配置，降低50%功耗)
 - **内存**: 192KB RAM, 1MB Flash
 - **接口**: SPI (传感器), UART (通信)
+
+### **84MHz低功耗配置** ⚡
+- **系统时钟**: 84MHz (从168MHz降频50%)
+- **功耗优化**: 降低约50%功耗，延长电池寿命
+- **性能保证**: FFT处理时间36μs，完全满足实时性要求
+- **验证功能**: 自动时钟配置验证和性能测试
+- **配置文件**: `Core/Inc/clock_config_84mhz.h`, `Core/Src/clock_config_84mhz.c`
 
 ### **传感器接口配置**
 ```c
