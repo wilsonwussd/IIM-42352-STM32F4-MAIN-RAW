@@ -73,22 +73,51 @@ IIM-42352-STM32F4/
 
 ### **84MHz低功耗配置** ⚡
 - **系统时钟**: 84MHz (从168MHz降频50%)
-- **功耗优化**: 降低约50%功耗，延长电池寿命
-- **性能保证**: FFT处理时间36μs，完全满足实时性要求
+- **功耗优化**: 降低约50%功耗，延长电池寿命约2倍
+- **性能保证**: FFT处理时间36μs，完全满足实时性要求 (512ms周期影响<0.01%)
+- **时钟配置**: PLL_VCO=336MHz, PLLP=DIV4, PLLQ=7 (USB时钟48MHz)
+- **Flash优化**: 等待周期从5降至2，提高访问效率
+- **APB优化**: APB1=42MHz, APB2=84MHz，保持外设性能
 - **验证功能**: 自动时钟配置验证和性能测试
 - **配置文件**: `Core/Inc/clock_config_84mhz.h`, `Core/Src/clock_config_84mhz.c`
 
+#### **84MHz配置技术细节**
+```c
+// PLL配置 (main.c中的SystemClock_Config函数)
+RCC_OscInitStruct.PLL.PLLM = 25;              // 25MHz/25 = 1MHz
+RCC_OscInitStruct.PLL.PLLN = 336;             // 1MHz×336 = 336MHz VCO
+RCC_OscInitStruct.PLL.PLLP = RCC_PLLP_DIV4;   // 336MHz/4 = 84MHz SYSCLK
+RCC_OscInitStruct.PLL.PLLQ = 7;               // 336MHz/7 = 48MHz USB时钟
+
+// Flash和总线配置
+HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_2);  // 2个等待周期
+RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV2;         // 42MHz
+RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;         // 84MHz
+```
+
+#### **84MHz配置验证功能**
+系统启动时自动执行时钟配置验证：
+```c
+Full_84MHz_Test();  // 在main.c中调用
+- Clock_Config_Verify()      // 验证时钟频率正确性
+- Print_Clock_Info()         // 显示详细时钟信息
+- Clock_Performance_Test()   // 性能测试 (计算/UART/SPI)
+- Print_Power_Analysis()     // 功耗分析报告
+```
+
 ### **传感器接口配置**
 ```c
-// SPI配置
-SPI_InitTypeDef SPI_InitStruct;
-SPI_InitStruct.SPI_Direction = SPI_Direction_2Lines_FullDuplex;
-SPI_InitStruct.SPI_Mode = SPI_Mode_Master;
-SPI_InitStruct.SPI_DataSize = SPI_DataSize_8b;
-SPI_InitStruct.SPI_CPOL = SPI_CPOL_High;
-SPI_InitStruct.SPI_CPHA = SPI_CPHA_2Edge;
-SPI_InitStruct.SPI_NSS = SPI_NSS_Soft;
-SPI_InitStruct.SPI_BaudRatePrescaler = SPI_BaudRatePrescaler_16;
+// SPI配置 (HAL库)
+SPI_HandleTypeDef hspi1;
+hspi1.Instance = SPI1;
+hspi1.Init.Mode = SPI_MODE_MASTER;
+hspi1.Init.Direction = SPI_DIRECTION_2LINES;
+hspi1.Init.DataSize = SPI_DATASIZE_8BIT;
+hspi1.Init.CLKPolarity = SPI_POLARITY_HIGH;
+hspi1.Init.CLKPhase = SPI_PHASE_2EDGE;
+hspi1.Init.NSS = SPI_NSS_SOFT;
+hspi1.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_128;  // 84MHz/128 ≈ 656kHz
+hspi1.Init.FirstBit = SPI_FIRSTBIT_MSB;
 ```
 
 ### **UART配置**
@@ -228,8 +257,10 @@ class VibrAnalyzer:            # 主界面
 数据点数: 257点 (单边谱)
 ```
 
-### **性能参数**
+### **性能参数** (84MHz配置)
 ```
+系统时钟: 84MHz (功耗优化配置)
+FFT处理时间: ~36μs (512点FFT)
 频域数据更新率: ~2Hz
 原始数据更新率: 10Hz
 传输带宽: ~2.5KB/s
@@ -237,6 +268,8 @@ class VibrAnalyzer:            # 主界面
 精度: 32位浮点数 (~7位有效数字)
 动态范围: 0.0001g - 4g
 显示窗口: 最近10秒原始数据
+功耗降低: ~50% (相比168MHz)
+电池寿命: 延长约2倍
 ```
 
 ## 🎯 **功能总结**
@@ -276,13 +309,40 @@ STM32F4 ←→ PC (USB转串口)
 ```
 
 ### **2. 软件部署**
-```bash
-# 编译烧录STM32代码
-1. 打开Keil MDK或STM32CubeIDE
-2. 导入项目
-3. 编译 (Build All)
-4. 烧录 (Run/Debug)
 
+#### **STM32固件编译 (推荐Keil MDK-ARM)**
+```bash
+# 使用Keil MDK-ARM编译 (推荐)
+1. 打开 MDK-ARM/IIM-42352-STM32F4.uvprojx
+2. 选择目标设备 (STM32F407VGT6)
+3. 编译项目 (Build All) - 确保无错误
+4. 连接ST-Link调试器
+5. 烧录程序 (Download)
+6. 观察串口输出验证84MHz配置
+
+# 预期串口输出 (84MHz配置验证)
+*************************************************
+*        STM32F4 84MHz配置验证测试             *
+*************************************************
+=== 时钟配置验证 ===
+SYSCLK: 84000000 Hz (目标: 84000000 Hz)
+✓ 系统时钟配置正确
+✓ APB1时钟在规范范围内
+✓ APB2时钟在规范范围内
+=== 性能测试开始 ===
+✓ 所有性能测试通过
+84MHz配置测试完成!
+
+# 或使用STM32CubeIDE (备选)
+1. 导入项目到工作空间
+2. 编译 (Build All)
+3. 烧录 (Run/Debug)
+⚠️ 重要提示: 避免使用STM32CubeMX重新生成代码，会覆盖84MHz配置
+   项目中的.ioc文件仍为168MHz配置，仅用Keil编译不会受影响
+```
+
+#### **Python上位机部署**
+```bash
 # 安装Python依赖
 pip install matplotlib numpy pyserial tkinter
 
@@ -387,6 +447,8 @@ python test_raw_data.py
 | 原始数据更新缓慢 | 串口通信问题 | 检查串口连接，重启程序 |
 | 中文字体乱码 | matplotlib字体问题 | 使用英文版或运行字体修复工具 |
 | FFT结果异常 | 传感器配置错误 | 检查传感器初始化代码 |
+| 系统时钟不是84MHz | CubeMX重新生成代码 | 使用Keil编译，避免CubeMX重新生成 |
+| 84MHz验证失败 | 时钟配置错误 | 检查main.c中的SystemClock_Config函数 |
 
 ### **调试工具**
 ```bash
@@ -401,6 +463,8 @@ run_analyzer.bat                  # 一键启动脚本
 - ✅ **高分辨率升级**: 从21点提升到257点 (12.8倍分辨率提升)
 - ✅ **同屏双视图**: 频域+时域同一界面显示，方便对比分析
 - ✅ **实时原始数据**: 三轴加速度实时波形监测
+- ✅ **84MHz低功耗优化**: 功耗降低50%，性能完全满足需求
+- ✅ **自动配置验证**: 启动时自动验证时钟配置和性能测试
 - ✅ **真实数据显示**: 摒弃人为放大，显示真实物理量
 - ✅ **专业显示控制**: 灵活的Y轴缩放和单位转换
 - ✅ **中文界面优化**: 完美解决字体显示问题
