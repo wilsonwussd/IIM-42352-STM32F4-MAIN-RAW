@@ -8,6 +8,8 @@
 - ✅ **高分辨率频谱分析**: 257点FFT，1.953Hz频率分辨率
 - ✅ **实时原始数据显示**: 三轴加速度实时波形 (新增功能)
 - ✅ **同屏双视图界面**: 频域+时域同一界面显示，方便对比分析
+- ✅ **LoRa无线通信**: 异常挖掘报警信号远程上报 (🆕 v3.2新增)
+- ✅ **智能挖掘检测**: 基于振动分析的挖掘行为检测系统
 - ✅ **真实数据显示**: 输出真实物理量，无人为放大
 - ✅ **灵活的Y轴控制**: 自动/手动/对数缩放，支持g/mg/μg单位转换
 - ✅ **专业上位机**: 中英文双版本，完整的显示控制功能
@@ -17,7 +19,8 @@
 - **传感器**: IIM-42352 (±4g, 1000Hz采样)
 - **处理器**: STM32F4系列
 - **FFT分辨率**: 512点，0-500Hz频率范围
-- **通信接口**: UART (115200bps)
+- **通信接口**: UART1 (调试串口, 115200bps) + UART5 (LoRa通信, 115200bps)
+- **无线通信**: LoRa模块 (Modbus协议)
 - **数据精度**: 32位浮点数
 
 ## 🏗️ **系统架构**
@@ -25,13 +28,19 @@
 ```
 传感器采集 → 数据处理 → 协议封装 → 串口传输 → 上位机显示
     ↓           ↓         ↓         ↓         ↓
-IIM-42352 → STM32F4 → 自定义协议 → UART → Python GUI
+IIM-42352 → STM32F4 → 自定义协议 → UART1 → Python GUI
            (FFT+原始)   (双协议)            (双视图)
+              ↓
+         挖掘检测算法
+              ↓
+         LoRa报警信号 → UART5 → LoRa模块 → 网关 → 云端
+         (Modbus协议)
 ```
 
 ### **数据流程**
 - **频域数据**: 1000Hz采样 → 512点FFT → 257点频谱 → 2Hz更新 → 上方图表
 - **原始数据**: 1000Hz采样 → 三轴加速度 → 10Hz更新 → 下方图表
+- **报警流程**: 异常检测 → LoRa报警 → 云端上报 → 状态反馈
 
 ## 📁 **项目结构**
 
@@ -58,6 +67,7 @@ IIM-42352-STM32F4/
 ├── vibration_analyzer_chinese.py     # 中文版上位机 (推荐)
 ├── vibration_analyzer_pro_en.py      # 英文版上位机
 ├── test_raw_data.py                  # 原始数据测试工具
+├── binary_command_test.py            # LoRa通信测试工具 (🆕 v3.2新增)
 ├── run_analyzer.bat                  # 一键启动脚本
 ├── UPGRADE_NOTES.md                  # 升级说明文档
 └── README.md                         # 本文档
@@ -122,14 +132,23 @@ hspi1.Init.FirstBit = SPI_FIRSTBIT_MSB;
 
 ### **UART配置**
 ```c
-// UART配置 (115200bps)
-UART_HandleTypeDef huart;
-huart.Instance = USART1;
-huart.Init.BaudRate = 115200;
-huart.Init.WordLength = UART_WORDLENGTH_8B;
-huart.Init.StopBits = UART_STOPBITS_1;
-huart.Init.Parity = UART_PARITY_NONE;
-huart.Init.Mode = UART_MODE_TX_RX;
+// UART1配置 (调试串口, 115200bps)
+UART_HandleTypeDef huart1;
+huart1.Instance = USART1;
+huart1.Init.BaudRate = 115200;
+huart1.Init.WordLength = UART_WORDLENGTH_8B;
+huart1.Init.StopBits = UART_STOPBITS_1;
+huart1.Init.Parity = UART_PARITY_NONE;
+huart1.Init.Mode = UART_MODE_TX_RX;
+
+// UART5配置 (LoRa通信, 115200bps)
+UART_HandleTypeDef huart5;
+huart5.Instance = UART5;
+huart5.Init.BaudRate = 115200;
+huart5.Init.WordLength = UART_WORDLENGTH_8B;
+huart5.Init.StopBits = UART_STOPBITS_1;
+huart5.Init.Parity = UART_PARITY_NONE;
+huart5.Init.Mode = UART_MODE_TX_RX;
 ```
 
 ### **FFT配置**
@@ -138,6 +157,70 @@ huart.Init.Mode = UART_MODE_TX_RX;
 #define FFT_SIZE 512
 #define SAMPLE_RATE 1000.0f
 #define FREQ_RESOLUTION (SAMPLE_RATE / FFT_SIZE)  // 1.953Hz
+```
+
+## 📡 **LoRa通信系统配置** (🆕 v3.2新增)
+
+### **硬件连接**
+```
+STM32F407:
+├── UART1 (PA9/PA10) ←→ 电脑调试串口 (115200bps)
+└── UART5 (PC12/PD2) ←→ LoRa模块 (115200bps)
+    ├── PC12 (UART5_TX) → LoRa模块 Rx
+    └── PD2 (UART5_RX) ← LoRa模块 Tx
+
+LoRa模块 ←→ 网关 ←→ 云端平台
+```
+
+### **通信协议**
+```c
+// Modbus协议命令格式
+寄存器置1: 01 46 00 00 00 01 02 00 01 E2 86
+寄存器置0: 01 46 00 00 00 01 02 00 00 23 46
+云端应答:   46 00 00 00 01 49 C5
+
+// 命令结构解析
+01        - 设备地址
+46        - 功能码 (写多个寄存器)
+00 00     - 寄存器地址 (0x0000)
+00 01     - 寄存器数量 (1个)
+02        - 数据长度 (2字节)
+00 XX     - 寄存器值 (XX: 00=置0, 01=置1)
+XX XX     - CRC16校验码
+```
+
+### **报警状态机**
+```c
+typedef enum {
+    ALARM_STATE_IDLE = 0,           // 空闲状态
+    ALARM_STATE_SET_1,              // 设置寄存器为1
+    ALARM_STATE_WAIT_RESPONSE_1,    // 等待设置1的响应
+    ALARM_STATE_HOLD,               // 保持1秒
+    ALARM_STATE_SET_0,              // 设置寄存器为0
+    ALARM_STATE_WAIT_RESPONSE_0,    // 等待设置0的响应
+    ALARM_STATE_COMPLETE            // 周期完成
+} alarm_state_t;
+
+// 报警周期时序
+1. 触发报警 → 发送Modbus命令(置1) → 等待LoRa响应
+2. 收到响应 → 保持1秒 → 发送Modbus命令(置0) → 等待LoRa响应
+3. 收到响应 → 报警周期完成
+```
+
+### **二进制命令协议**
+```c
+// 上位机 → STM32 命令
+0x10 - 触发LoRa报警周期
+0x11 - 查询系统状态
+0x02 - 原始数据命令 (兼容)
+0x04 - FFT数据命令 (兼容)
+
+// STM32 → 上位机 响应
+"ALARM_TRIGGERED"        - 报警已触发
+"ALARM_SET_SUCCESS"      - 寄存器置1成功
+"ALARM_RESET_SUCCESS"    - 寄存器置0成功
+"ALARM_CYCLE_COMPLETE"   - 报警周期完成
+"STATUS_OK"              - 系统状态正常
 ```
 
 ## 📡 **传感器配置总结**
@@ -183,6 +266,8 @@ rc |= inv_iim423xx_write_reg(&icm_driver, MPUREG_ACCEL_CONFIG_STATIC4_B2, 1, &da
 | 0x01 | 21点频谱 | 88字节 | 时间戳(4) + 21个浮点数(84) | ~2Hz |
 | 0x02 | 原始加速度 | 16字节 | 时间戳(4) + X/Y/Z轴(12) | 10Hz |
 | 0x04 | 257点频谱 | 1032字节 | 时间戳(4) + 257个浮点数(1028) | ~2Hz |
+| 0x10 | LoRa报警触发 | 0字节 | 触发异常挖掘报警周期 | 按需 |
+| 0x11 | LoRa状态查询 | 0字节 | 查询LoRa通信系统状态 | 按需 |
 
 ### **数据格式**
 ```c
@@ -220,6 +305,7 @@ checksum ^= ((payload_len >> 8) & 0xFF);
 | 中文专业版 | `vibration_analyzer_chinese.py` | 中文 | 完整功能，双视图显示，字体已修复 |
 | 英文专业版 | `vibration_analyzer_pro_en.py` | 英文 | 完整功能，无字体问题 |
 | 测试工具 | `test_raw_data.py` | 中文 | 原始数据接收测试 |
+| LoRa测试工具 | `binary_command_test.py` | 中文 | LoRa通信系统测试 (🆕 v3.2新增) |
 
 ### **核心功能模块**
 ```python
@@ -279,6 +365,10 @@ FFT处理时间: ~36μs (512点FFT)
 - ✅ **实时FFT处理**: 512点FFT，窗函数优化
 - ✅ **原始数据发送**: 三轴加速度实时传输
 - ✅ **双协议支持**: 频域数据 + 原始数据协议
+- ✅ **LoRa无线通信**: 异常挖掘报警信号远程上报 (🆕 v3.2新增)
+- ✅ **Modbus协议**: 标准工业通信协议，CRC16校验
+- ✅ **双串口管理**: UART1(调试) + UART5(LoRa)，中断安全
+- ✅ **报警状态机**: 完整的报警周期管理，超时处理
 - ✅ **协议封装**: 自定义高效协议
 - ✅ **串口通信**: 115200bps稳定传输
 - ✅ **多模式支持**: 21点兼容模式 + 257点高分辨率模式
@@ -305,7 +395,9 @@ FFT处理时间: ~36μs (512点FFT)
 ### **1. 硬件连接**
 ```
 STM32F4 ←→ IIM-42352 (SPI接口)
-STM32F4 ←→ PC (USB转串口)
+STM32F4 ←→ PC (USB转串口, UART1)
+STM32F4 ←→ LoRa模块 (UART5)
+LoRa模块 ←→ 网关 ←→ 云端平台
 ```
 
 ### **2. 软件部署**
@@ -352,6 +444,9 @@ python vibration_analyzer_chinese.py  # 中文版 (推荐)
 python vibration_analyzer_pro_en.py   # 英文版
 # 或使用一键启动
 run_analyzer.bat                       # Windows一键启动
+
+# LoRa通信系统测试 (🆕 v3.2新增)
+python binary_command_test.py         # LoRa通信功能测试
 ```
 
 ### **3. 操作步骤**
@@ -383,6 +478,17 @@ python test_raw_data.py
 - 数据缩放处理 ✅
 - 原始数据显示 ✅
 - GUI组件功能 ✅
+
+# LoRa通信系统测试 (🆕 v3.2新增)
+python binary_command_test.py
+
+# 检查项目:
+- 二进制命令协议 ✅
+- LoRa报警周期 ✅
+- Modbus通信 ✅
+- 状态机管理 ✅
+- 超时处理 ✅
+- 双串口通信 ✅
 ```
 
 ### **2. 数据真实性测试**
@@ -449,10 +555,15 @@ python test_raw_data.py
 | FFT结果异常 | 传感器配置错误 | 检查传感器初始化代码 |
 | 系统时钟不是84MHz | CubeMX重新生成代码 | 使用Keil编译，避免CubeMX重新生成 |
 | 84MHz验证失败 | 时钟配置错误 | 检查main.c中的SystemClock_Config函数 |
+| LoRa命令无响应 | 二进制协议错误 | 使用binary_command_test.py测试 |
+| LoRa通信超时 | 硬件连接问题 | 检查UART5连接，确认LoRa模块工作 |
+| Modbus命令失败 | CRC校验错误 | 检查CRC16计算函数 |
+| 报警周期异常 | 状态机错误 | 检查Process_Alarm_State_Machine函数 |
 
 ### **调试工具**
 ```bash
 python test_raw_data.py           # 原始数据接收测试
+python binary_command_test.py     # LoRa通信系统测试 (🆕 v3.2新增)
 python vibration_analyzer_pro_en.py  # 英文版（无字体问题）
 run_analyzer.bat                  # 一键启动脚本
 ```
@@ -463,6 +574,10 @@ run_analyzer.bat                  # 一键启动脚本
 - ✅ **高分辨率升级**: 从21点提升到257点 (12.8倍分辨率提升)
 - ✅ **同屏双视图**: 频域+时域同一界面显示，方便对比分析
 - ✅ **实时原始数据**: 三轴加速度实时波形监测
+- ✅ **LoRa无线通信**: 异常挖掘报警信号远程上报系统 (🆕 v3.2新增)
+- ✅ **智能挖掘检测**: 基于振动分析的挖掘行为检测算法
+- ✅ **Modbus工业协议**: 标准工业通信协议，CRC16校验保证可靠性
+- ✅ **双串口架构**: UART1+UART5双通道，调试与LoRa通信分离
 - ✅ **84MHz低功耗优化**: 功耗降低50%，性能完全满足需求
 - ✅ **自动配置验证**: 启动时自动验证时钟配置和性能测试
 - ✅ **真实数据显示**: 摒弃人为放大，显示真实物理量
@@ -472,6 +587,9 @@ run_analyzer.bat                  # 一键启动脚本
 ### **应用价值**
 - 🎯 **精密设备监测**: 可检测0.0001g级别的微振动
 - 🎯 **机械故障诊断**: 高分辨率频谱分析 + 时域波形分析
+- 🎯 **智能挖掘监测**: 基于振动分析的非法挖掘检测与报警 (🆕 v3.2新增)
+- 🎯 **远程报警系统**: LoRa无线通信，实现远程监控和报警
+- 🎯 **工业物联网**: 标准Modbus协议，易于集成到现有工业系统
 - 🎯 **振动测试平台**: 专业的测试和分析工具
 - 🎯 **冲击检测**: 实时监测瞬态振动和冲击事件
 - 🎯 **教学研究**: 完整的振动分析系统示例
@@ -535,6 +653,66 @@ typedef struct {
 ### **升级说明**
 详细的升级说明请参考 [UPGRADE_NOTES.md](UPGRADE_NOTES.md)
 
+## 🆕 **v3.2 新增功能详解** - LoRa无线通信系统
+
+### **智能挖掘检测与报警系统**
+
+#### **系统概述**
+基于振动分析的智能挖掘检测系统，当检测到异常挖掘活动时，通过LoRa无线通信将报警信号上报到云端平台，实现远程监控和预警。
+
+#### **核心功能**
+- **异常挖掘检测**: 基于振动频谱分析的挖掘行为识别算法
+- **LoRa无线通信**: 远距离、低功耗的无线数据传输
+- **Modbus工业协议**: 标准工业通信协议，确保数据可靠性
+- **云端集成**: 与云平台无缝对接，支持远程监控
+- **实时报警**: 检测到异常后立即上报，响应迅速
+
+#### **技术架构**
+```
+振动传感器 → STM32分析 → 异常检测 → LoRa模块 → 网关 → 云端平台
+    ↓           ↓         ↓         ↓       ↓      ↓
+IIM-42352 → FFT分析 → 挖掘算法 → Modbus → 无线传输 → 远程监控
+```
+
+#### **报警流程**
+1. **振动监测**: 持续监测环境振动信号
+2. **异常检测**: 基于频谱特征识别挖掘行为
+3. **报警触发**: 检测到异常后触发报警周期
+4. **LoRa通信**: 通过Modbus协议发送报警信号
+5. **云端上报**: 报警信息上传到云端平台
+6. **状态反馈**: 确认报警信号成功发送
+
+#### **LoRa通信测试工具**
+```python
+# binary_command_test.py - 专业LoRa通信测试工具
+class STM32LoRaTester:
+    - 二进制命令协议测试
+    - LoRa报警周期验证
+    - Modbus通信状态监控
+    - 实时数据流监控
+    - 自动化测试流程
+```
+
+#### **测试功能**
+- **状态查询**: 发送0x11命令查询系统状态
+- **报警触发**: 发送0x10命令触发完整报警周期
+- **通信监控**: 实时监控LoRa通信过程
+- **结果验证**: 自动验证报警周期完整性
+
+#### **使用场景**
+- **矿区监控**: 监测非法挖掘活动
+- **基础设施保护**: 监控地下管线挖掘
+- **考古保护**: 保护文物遗址免受破坏
+- **环境监测**: 监控土地开发活动
+- **安全防护**: 工业区域安全监控
+
+#### **技术优势**
+- **低功耗**: LoRa技术，电池供电可持续数月
+- **远距离**: 通信距离可达数公里
+- **高可靠**: Modbus协议+CRC校验，确保数据完整性
+- **易部署**: 无需布线，快速部署
+- **标准化**: 采用工业标准协议，易于集成
+
 ---
 
-**专业振动分析系统 v3.1 - 真实数据，精确分析，全面监测** 🚀
+**专业振动分析系统 v3.2 - 真实数据，精确分析，全面监测，智能报警** 🚀
