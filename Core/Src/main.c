@@ -97,9 +97,38 @@
 SPI_HandleTypeDef hspi1;
 
 UART_HandleTypeDef huart1;
+UART_HandleTypeDef huart5;
 
 /* USER CODE BEGIN PV */
+/* LoRa Communication Variables */
+uint8_t lora_rx_buffer[64];
+uint8_t lora_tx_buffer[64];
+volatile uint8_t lora_rx_complete = 0;
+volatile uint8_t lora_tx_complete = 1;
+uint8_t lora_rx_index = 0;
 
+/* Upper Computer Communication Variables */
+uint8_t uart1_rx_buffer[64];
+volatile uint8_t uart1_rx_complete = 0;
+uint8_t uart1_rx_index = 0;
+
+/* Alarm Signal State */
+typedef enum {
+    ALARM_STATE_IDLE = 0,
+    ALARM_STATE_SET_1,
+    ALARM_STATE_WAIT_RESPONSE_1,
+    ALARM_STATE_HOLD,
+    ALARM_STATE_SET_0,
+    ALARM_STATE_WAIT_RESPONSE_0,
+    ALARM_STATE_COMPLETE
+} alarm_state_t;
+
+volatile alarm_state_t alarm_state = ALARM_STATE_IDLE;
+uint32_t alarm_hold_start_time = 0;
+uint32_t lora_timeout_start_time = 0;
+
+#define ALARM_HOLD_TIME_MS      1000    // 1 second hold time
+#define LORA_TIMEOUT_MS         5000    // 5 second timeout for LoRa response
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -107,6 +136,7 @@ void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
 static void MX_SPI1_Init(void);
 static void MX_USART1_UART_Init(void);
+static void MX_UART5_Init(void);
 static void check_rc(int rc, const char * msg_context);
 void msg_printer(int level, const char * str, va_list ap);
 
@@ -116,6 +146,19 @@ static void SetupMCUHardware(struct inv_iim423xx_serif * icm_serif);
 void inv_iim423xx_sleep_ms(uint32_t ms);
 void inv_iim423xx_sleep_us(uint32_t us);
 void Simple_Protocol_Test(void);  // 协议测试函数声明
+
+/* LoRa Communication Functions */
+uint16_t Calculate_CRC16_Modbus(uint8_t *data, uint16_t length);
+void Build_Modbus_Command(uint8_t value, uint8_t *command_buffer);
+void LoRa_Send_Command(uint8_t *command, uint8_t length);
+void Process_Alarm_State_Machine(void);
+void Trigger_Alarm_Cycle(void);
+
+/* Upper Computer Communication Functions */
+void Process_UART1_Command(void);
+void Send_Response_To_PC(const char *message);
+void Start_UART1_Reception(void);
+void Start_LoRa_Reception(void);
 /* USER CODE END PFP */
 //low-levevl IO access function
 int inv_io_hal_read_reg(struct inv_iim423xx_serif * serif, uint8_t reg, uint8_t * rbuffer, uint32_t rlen);
@@ -183,6 +226,7 @@ int main(void)
   MX_GPIO_Init();
   MX_SPI1_Init();
   MX_USART1_UART_Init();
+  MX_UART5_Init();
 //  /* USER CODE BEGIN 2 */
   printf("\nIIM42352 SPI Test - 84MHz Configuration\n");
   printf("Bolgen Studio\n");
@@ -191,6 +235,13 @@ int main(void)
   Full_84MHz_Test();
 
 	   HAL_Delay(1000);
+
+  /* Initialize UART reception */
+  Start_UART1_Reception();
+  Start_LoRa_Reception();
+
+  printf("LoRa Communication System Initialized\n");
+  printf("Waiting for commands from upper computer...\n");
 
 		/* Initialize MCU hardware */
 	SetupMCUHardware(&iim423xx_serif);
@@ -233,6 +284,36 @@ int main(void)
 
 		/* FFT自动处理模式，无需手动检查 */
 		// FFT处理和数据输出现在是自动的
+
+		/* Process upper computer commands */
+		if (uart1_rx_complete) {
+			Process_UART1_Command();
+			uart1_rx_complete = 0;
+			Start_UART1_Reception();  // Restart reception
+		}
+
+		// 直接读取UART1数据寄存器 - 处理二进制命令
+		if (__HAL_UART_GET_FLAG(&huart1, UART_FLAG_RXNE)) {
+			// 直接从数据寄存器读取
+			uint8_t received_char = (uint8_t)(huart1.Instance->DR & 0xFF);
+
+			// 处理二进制命令（单字节命令）
+			if (uart1_rx_index == 0) {
+				// 第一个字节，检查是否是有效命令
+				if (received_char == 0x10 || received_char == 0x11 ||
+				    received_char == 0x02 || received_char == 0x04) {
+					uart1_rx_buffer[uart1_rx_index] = received_char;
+					uart1_rx_index++;
+					uart1_rx_complete = 1;  // 单字节命令立即完成
+				}
+			} else {
+				// 缓冲区溢出保护，重置
+				uart1_rx_index = 0;
+			}
+		}
+
+		/* Process alarm state machine */
+		Process_Alarm_State_Machine();
 
 		/* 协议测试 - 每10秒发送一次测试数据 (可选) */
 		static uint32_t last_test_time = 0;
@@ -366,6 +447,39 @@ static void MX_USART1_UART_Init(void)
   }
 
   /* USER CODE END USART1_Init 2 */
+
+}
+
+/**
+  * @brief UART5 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_UART5_Init(void)
+{
+
+  /* USER CODE BEGIN UART5_Init 0 */
+
+  /* USER CODE END UART5_Init 0 */
+
+  /* USER CODE BEGIN UART5_Init 1 */
+
+  /* USER CODE END UART5_Init 1 */
+  huart5.Instance = UART5;
+  huart5.Init.BaudRate = 115200;
+  huart5.Init.WordLength = UART_WORDLENGTH_8B;
+  huart5.Init.StopBits = UART_STOPBITS_1;
+  huart5.Init.Parity = UART_PARITY_NONE;
+  huart5.Init.Mode = UART_MODE_TX_RX;
+  huart5.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+  huart5.Init.OverSampling = UART_OVERSAMPLING_16;
+
+  if (HAL_UART_Init(&huart5) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /* USER CODE END UART5_Init 2 */
 
 }
 
@@ -845,6 +959,293 @@ void Simple_Protocol_Test(void)
 
     printf("PROTOCOL_FRAME_END\r\n");
 }
+
+/**
+ * @brief Calculate CRC16 for Modbus protocol
+ * @param data: Data buffer
+ * @param length: Data length
+ * @retval CRC16 value
+ */
+uint16_t Calculate_CRC16_Modbus(uint8_t *data, uint16_t length)
+{
+    uint16_t crc = 0xFFFF;
+    uint16_t i, j;
+
+    for (i = 0; i < length; i++) {
+        crc ^= data[i];
+        for (j = 0; j < 8; j++) {
+            if (crc & 0x0001) {
+                crc = (crc >> 1) ^ 0xA001;
+            } else {
+                crc = crc >> 1;
+            }
+        }
+    }
+
+    return crc;
+}
+
+/**
+ * @brief Build Modbus command for alarm register
+ * @param value: Register value (0 or 1)
+ * @param command_buffer: Output buffer for command
+ */
+void Build_Modbus_Command(uint8_t value, uint8_t *command_buffer)
+{
+    // Modbus command structure: 01 46 00 00 00 01 02 00 [value] [CRC_L] [CRC_H]
+    command_buffer[0] = 0x01;  // Device address
+    command_buffer[1] = 0x46;  // Function code (Write Multiple Registers)
+    command_buffer[2] = 0x00;  // Register address high byte
+    command_buffer[3] = 0x00;  // Register address low byte
+    command_buffer[4] = 0x00;  // Number of registers high byte
+    command_buffer[5] = 0x01;  // Number of registers low byte (1 register)
+    command_buffer[6] = 0x02;  // Data length (2 bytes)
+    command_buffer[7] = 0x00;  // Data high byte
+    command_buffer[8] = value; // Data low byte (0 or 1)
+
+    // Calculate CRC16
+    uint16_t crc = Calculate_CRC16_Modbus(command_buffer, 9);
+    command_buffer[9] = (uint8_t)(crc & 0xFF);        // CRC low byte
+    command_buffer[10] = (uint8_t)((crc >> 8) & 0xFF); // CRC high byte
+}
+
+/**
+ * @brief Send command to LoRa module
+ * @param command: Command buffer
+ * @param length: Command length
+ */
+void LoRa_Send_Command(uint8_t *command, uint8_t length)
+{
+    lora_tx_complete = 0;
+    lora_timeout_start_time = HAL_GetTick();
+
+    // Send command via UART5
+    HAL_UART_Transmit(&huart5, command, length, 1000);
+    lora_tx_complete = 1;
+
+    printf("LoRa Command Sent: ");
+    for (int i = 0; i < length; i++) {
+        printf("%02X ", command[i]);
+    }
+    printf("\n");
+}
+
+// LoRa_Wait_Response函数已删除，改用状态机中的直接检查方式
+
+/**
+ * @brief Process alarm state machine
+ */
+void Process_Alarm_State_Machine(void)
+{
+    static uint8_t modbus_command[11];
+    static uint8_t response[10];
+
+    switch (alarm_state) {
+        case ALARM_STATE_SET_1:
+            printf("Setting alarm register to 1...\n");
+            Build_Modbus_Command(1, modbus_command);
+            LoRa_Send_Command(modbus_command, 11);
+            alarm_state = ALARM_STATE_WAIT_RESPONSE_1;
+            break;
+
+        case ALARM_STATE_WAIT_RESPONSE_1:
+            // 检查是否收到LoRa响应
+            if (lora_rx_complete) {
+                // 复制响应数据
+                memcpy(response, lora_rx_buffer, lora_rx_index);
+
+                printf("Alarm set to 1 confirmed\n");
+                printf("LoRa Response Received: ");
+                for (int i = 0; i < lora_rx_index; i++) {
+                    printf("%02X ", lora_rx_buffer[i]);
+                }
+                printf("\n");
+
+                // 重置接收状态
+                lora_rx_complete = 0;
+                lora_rx_index = 0;
+                Start_LoRa_Reception();
+
+                // 进入保持状态
+                alarm_hold_start_time = HAL_GetTick();
+                alarm_state = ALARM_STATE_HOLD;
+                Send_Response_To_PC("ALARM_SET_SUCCESS");
+            } else if ((HAL_GetTick() - lora_timeout_start_time) > LORA_TIMEOUT_MS) {
+                printf("Timeout waiting for response to set 1\n");
+                alarm_state = ALARM_STATE_IDLE;
+                Send_Response_To_PC("ALARM_SET_TIMEOUT");
+            }
+            break;
+
+        case ALARM_STATE_HOLD:
+            if ((HAL_GetTick() - alarm_hold_start_time) >= ALARM_HOLD_TIME_MS) {
+                printf("Hold time completed, setting alarm register to 0...\n");
+                Build_Modbus_Command(0, modbus_command);
+                LoRa_Send_Command(modbus_command, 11);
+                alarm_state = ALARM_STATE_WAIT_RESPONSE_0;
+            }
+            break;
+
+        case ALARM_STATE_WAIT_RESPONSE_0:
+            // 检查是否收到LoRa响应
+            if (lora_rx_complete) {
+                // 复制响应数据
+                memcpy(response, lora_rx_buffer, lora_rx_index);
+
+                printf("Alarm set to 0 confirmed\n");
+                printf("LoRa Response Received: ");
+                for (int i = 0; i < lora_rx_index; i++) {
+                    printf("%02X ", lora_rx_buffer[i]);
+                }
+                printf("\n");
+
+                // 重置接收状态
+                lora_rx_complete = 0;
+                lora_rx_index = 0;
+                Start_LoRa_Reception();
+
+                // 进入完成状态
+                alarm_state = ALARM_STATE_COMPLETE;
+                Send_Response_To_PC("ALARM_RESET_SUCCESS");
+            } else if ((HAL_GetTick() - lora_timeout_start_time) > LORA_TIMEOUT_MS) {
+                printf("Timeout waiting for response to set 0\n");
+                alarm_state = ALARM_STATE_IDLE;
+                Send_Response_To_PC("ALARM_RESET_TIMEOUT");
+            }
+            break;
+
+        case ALARM_STATE_COMPLETE:
+            printf("Alarm cycle completed successfully\n");
+            alarm_state = ALARM_STATE_IDLE;
+            Send_Response_To_PC("ALARM_CYCLE_COMPLETE");
+            break;
+
+        default:
+            break;
+    }
+}
+
+/**
+ * @brief Trigger alarm cycle
+ */
+void Trigger_Alarm_Cycle(void)
+{
+    if (alarm_state == ALARM_STATE_IDLE) {
+        alarm_state = ALARM_STATE_SET_1;
+        printf("Alarm cycle triggered\n");
+    } else {
+        printf("Alarm cycle already in progress\n");
+    }
+}
+
+/**
+ * @brief Process UART1 command from upper computer
+ */
+void Process_UART1_Command(void)
+{
+    // 处理二进制协议命令
+    if (uart1_rx_index >= 1) {
+        uint8_t command = uart1_rx_buffer[0];
+
+        switch (command) {
+            case 0x10:  // 触发报警命令
+                // 触发LoRa报警周期
+                Trigger_Alarm_Cycle();
+                Send_Response_To_PC("ALARM_TRIGGERED");
+                break;
+
+            case 0x11:  // 查询状态命令
+                // 发送状态响应
+                Send_Response_To_PC("STATUS_OK");
+                break;
+
+            case 0x02:  // 原始数据命令（保持兼容）
+                // 继续发送原始数据（已经在主循环中处理）
+                break;
+
+            case 0x04:  // FFT数据命令（保持兼容）
+                // 继续发送FFT数据（已经在主循环中处理）
+                break;
+
+            default:
+                // 未知命令
+                break;
+        }
+    }
+
+    // Clear buffer
+    memset(uart1_rx_buffer, 0, sizeof(uart1_rx_buffer));
+    uart1_rx_index = 0;
+}
+
+/**
+ * @brief Send response to PC via UART1
+ * @param message: Message to send
+ */
+void Send_Response_To_PC(const char *message)
+{
+    char response[128];
+    snprintf(response, sizeof(response), "RESPONSE:%s\n", message);
+    HAL_UART_Transmit(&huart1, (uint8_t*)response, strlen(response), 1000);
+    printf("Sent to PC: %s", response);
+}
+
+/**
+ * @brief Start UART1 reception
+ */
+void Start_UART1_Reception(void)
+{
+    uart1_rx_index = 0;
+    uart1_rx_complete = 0;
+    HAL_UART_Receive_IT(&huart1, &uart1_rx_buffer[uart1_rx_index], 1);
+}
+
+/**
+ * @brief Start LoRa reception
+ */
+void Start_LoRa_Reception(void)
+{
+    lora_rx_index = 0;
+    lora_rx_complete = 0;
+    HAL_UART_Receive_IT(&huart5, &lora_rx_buffer[lora_rx_index], 1);
+}
+
+/**
+ * @brief UART receive complete callback
+ * @param huart: UART handle
+ */
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
+{
+    if (huart->Instance == USART1) {
+        // UART1 - Upper computer communication - 简化版本，避免printf导致重启
+        if (uart1_rx_buffer[uart1_rx_index] == '\n' || uart1_rx_buffer[uart1_rx_index] == '\r') {
+            uart1_rx_buffer[uart1_rx_index] = '\0';
+            uart1_rx_complete = 1;
+        } else {
+            uart1_rx_index++;
+            if (uart1_rx_index < sizeof(uart1_rx_buffer) - 1) {
+                HAL_UART_Receive_IT(&huart1, &uart1_rx_buffer[uart1_rx_index], 1);
+            } else {
+                // Buffer overflow, reset
+                uart1_rx_index = 0;
+                HAL_UART_Receive_IT(&huart1, &uart1_rx_buffer[uart1_rx_index], 1);
+            }
+        }
+    } else if (huart->Instance == UART5) {
+        // UART5 - LoRa communication - 简化版本
+        lora_rx_index++;
+        if (lora_rx_index >= 7) {  // Expected response length for Modbus
+            lora_rx_complete = 1;
+        } else if (lora_rx_index < sizeof(lora_rx_buffer)) {
+            HAL_UART_Receive_IT(&huart5, &lora_rx_buffer[lora_rx_index], 1);
+        } else {
+            // Buffer overflow, reset
+            lora_rx_index = 0;
+            HAL_UART_Receive_IT(&huart5, &lora_rx_buffer[lora_rx_index], 1);
+        }
+    }
+}
+
 /* USER CODE END 4 */
 
 /************************ (C) COPYRIGHT STMicroelectronics *****END OF FILE****/
