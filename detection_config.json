@@ -1,0 +1,47 @@
+{
+  "coarse_detection": {
+    "rms_threshold_multiplier": 4.0,
+    "peak_factor_threshold": 1.8,
+    "duration_threshold_sec": 8.0,
+    "window_size_sec": 2.0,
+    "cooldown_time_sec": 30.0,
+    "adaptive_enabled": true,
+    "baseline_update_rate": 0.1
+  },
+  "fine_detection": {
+    "frequency_bands": [
+      5,
+      15,
+      30,
+      100,
+      500
+    ],
+    "confidence_threshold": 0.9,
+    "svm_c": 1.0,
+    "svm_gamma": "scale",
+    "feature_weights": [
+      1.0,
+      1.0,
+      1.0,
+      1.0
+    ],
+    "harmonic_analysis": true
+  },
+  "filtering": {
+    "highpass_cutoff_hz": 5.0,
+    "filter_order": 4,
+    "filter_type": "butterworth"
+  },
+  "system": {
+    "detection_enabled": true,
+    "auto_adaptive": true,
+    "data_logging": false,
+    "performance_monitor": true
+  },
+  "debug": {
+    "log_level": "info",
+    "save_raw_data": false,
+    "save_features": false,
+    "show_intermediate_results": true
+  }
+}
