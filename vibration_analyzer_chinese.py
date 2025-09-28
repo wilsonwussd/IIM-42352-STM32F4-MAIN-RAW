@@ -932,6 +932,7 @@ class VibrAnalyzer:
         self.detection_mode = tk.StringVar(value="两级检测")
         self.sensitivity_level = tk.StringVar(value="中等")
         self.detection_enabled = tk.BooleanVar(value=True)
+        self.stm32_alarm_enabled = tk.BooleanVar(value=True)  # STM32报警触发开关
 
         # 检测状态
         self.detection_results = deque(maxlen=100)
@@ -979,6 +980,35 @@ class VibrAnalyzer:
         """线程安全的串口连接设置"""
         with self._serial_lock:
             self.serial_conn = conn
+
+    def send_alarm_trigger_to_stm32(self):
+        """发送触发报警命令给STM32"""
+        try:
+            # 检查STM32报警功能是否启用
+            if not self.stm32_alarm_enabled.get():
+                print("ℹ️ STM32报警触发功能已禁用，跳过发送命令")
+                return False
+
+            # 线程安全的串口访问
+            serial_conn = self.get_serial_connection()
+
+            if serial_conn and serial_conn.is_open:
+                # 发送0x10命令（触发报警）
+                command = bytes([0x10])
+                serial_conn.write(command)
+                print(f"🚨 已发送触发报警命令给STM32: 0x{command[0]:02X}")
+
+                # 记录到日志
+                self.detection_logger.logger.info(f"发送STM32触发报警命令: 0x{command[0]:02X}")
+                return True
+            else:
+                print("⚠️ 串口未连接，无法发送触发报警命令")
+                return False
+
+        except Exception as e:
+            print(f"❌ 发送触发报警命令失败: {e}")
+            self.detection_logger.logger.error(f"发送STM32触发报警命令失败: {e}")
+            return False
 
     def init_fine_detector(self):
         """初始化细检测器"""
@@ -1176,6 +1206,10 @@ class VibrAnalyzer:
         ttk.Checkbutton(mode_frame, text="启用检测", variable=self.detection_enabled,
                        command=self.on_detection_enabled_changed).pack(side=tk.LEFT, padx=(20, 0))
 
+        # STM32报警触发开关
+        ttk.Checkbutton(mode_frame, text="STM32报警", variable=self.stm32_alarm_enabled,
+                       command=self.on_stm32_alarm_changed).pack(side=tk.LEFT, padx=(10, 0))
+
         # 高级设置按钮
         ttk.Button(mode_frame, text="高级设置", command=self.open_advanced_settings).pack(side=tk.LEFT, padx=(20, 0))
 
@@ -1231,6 +1265,13 @@ class VibrAnalyzer:
         enabled = self.detection_enabled.get()
         status = "启用" if enabled else "禁用"
         print(f"检测功能{status}")
+
+    def on_stm32_alarm_changed(self):
+        """STM32报警开关改变回调"""
+        enabled = self.stm32_alarm_enabled.get()
+        status = "启用" if enabled else "禁用"
+        print(f"STM32报警触发功能{status}")
+        self.detection_logger.logger.info(f"STM32报警触发功能{status}")
 
     def set_sensitivity_preset(self, level):
         """设置灵敏度预设"""
@@ -1963,6 +2004,9 @@ class VibrAnalyzer:
 
                     # 记录粗检测挖掘事件的详细数据
                     self.record_coarse_mining_event(log_data)
+
+                    # 发送触发报警命令给STM32
+                    self.send_alarm_trigger_to_stm32()
             else:
                 # 检查冷却时间是否结束
                 if current_time > self.trigger_cooldown_time:
@@ -2110,6 +2154,9 @@ class VibrAnalyzer:
 
                     # 记录详细事件数据
                     self.event_recorder.record_mining_event(mining_event)
+
+                    # 发送触发报警命令给STM32
+                    self.send_alarm_trigger_to_stm32()
 
         except Exception as e:
             self.detection_logger.logger.error(f"细检测执行失败: {e}")
