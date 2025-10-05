@@ -54,14 +54,16 @@ typedef struct {
     float32_t time_buffer[FFT_BUFFER_SIZE];     // Time domain circular buffer
     float32_t fft_input[FFT_SIZE * 2];          // FFT input buffer (complex: real, imag, real, imag...)
     float32_t fft_output[FFT_SIZE];             // FFT magnitude output
-    
+
     uint32_t buffer_index;                      // Current buffer write index
     uint32_t sample_count;                      // Total samples collected
     fft_state_t state;                          // Current processing state
-    
+
     bool auto_process;                          // Auto process when buffer full
     bool window_enabled;                        // Apply windowing function
-    
+    bool trigger_mode;                          // Trigger-based processing mode (Stage 3)
+    bool is_triggered;                          // Current trigger state
+
     fft_result_t last_result;                   // Last FFT computation result
 } fft_processor_t;
 
@@ -128,15 +130,7 @@ void FFT_PrintResults(bool detailed);
  */
 void FFT_PrintSpectrumCSV(void);
 
-/**
- * @brief Send spectrum data via protocol (21 points, legacy mode)
- */
-void FFT_SendSpectrumViaProtocol(void);
-
-/**
- * @brief Send full spectrum data via protocol (257 points, high resolution)
- */
-void FFT_SendFullSpectrumViaProtocol(void);
+/* FFT数据发送函数已删除 - 调试串口现在专用于调试信息输出 */
 
 /**
  * @brief Print frequency spectrum chart similar to reference image
@@ -156,5 +150,33 @@ float32_t FFT_BinToFrequency(uint32_t bin_index);
  * @return Bin index
  */
 uint32_t FFT_FrequencyToBin(float32_t frequency);
+
+/* Stage 3: Intelligent FFT Control Functions */
+
+/**
+ * @brief Enable trigger-based FFT processing mode
+ * @param enable: true to enable trigger mode, false for continuous mode
+ * @return 0 on success, negative on error
+ */
+int FFT_SetTriggerMode(bool enable);
+
+/**
+ * @brief Set FFT trigger state (called by coarse detector)
+ * @param triggered: true when vibration detected, false when idle
+ * @return 0 on success, negative on error
+ */
+int FFT_SetTriggerState(bool triggered);
+
+/**
+ * @brief Get current FFT trigger state
+ * @return true if triggered, false if idle
+ */
+bool FFT_GetTriggerState(void);
+
+/**
+ * @brief Check if FFT should process samples based on trigger state
+ * @return true if should process, false if should skip
+ */
+bool FFT_ShouldProcess(void);
 
 #endif /* _FFT_PROCESSOR_H_ */

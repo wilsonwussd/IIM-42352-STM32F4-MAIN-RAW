@@ -11,6 +11,9 @@
 #include <string.h>
 #include <math.h>
 
+/* External function declaration to avoid header conflicts */
+extern uint32_t HAL_GetTick(void);
+
 /* Mathematical constants */
 #ifndef PI
 #define PI 3.14159265358979323846f
@@ -37,10 +40,12 @@ int FFT_Init(bool auto_process, bool window_enabled)
 {
     // Clear the processor structure
     memset(&fft_processor, 0, sizeof(fft_processor_t));
-    
+
     // Set configuration
     fft_processor.auto_process = auto_process;
     fft_processor.window_enabled = window_enabled;
+    fft_processor.trigger_mode = false;  // Stage 3: Default to continuous mode
+    fft_processor.is_triggered = false;  // Stage 3: Default to not triggered
     fft_processor.state = FFT_STATE_IDLE;
     
     // Precompute Hanning window if enabled
@@ -72,6 +77,12 @@ int FFT_AddSample(float32_t sample)
         return 0; // Ignore samples during processing
     }
 
+    // Stage 3: Check if we should process samples based on trigger mode
+    if (fft_processor.trigger_mode && !fft_processor.is_triggered) {
+        // In trigger mode but not triggered: skip sample collection to save power
+        return 0;
+    }
+
     // Add sample to circular buffer
     fft_processor.time_buffer[fft_processor.buffer_index] = sample;
     fft_processor.buffer_index = (fft_processor.buffer_index + 1) % FFT_BUFFER_SIZE;
@@ -86,8 +97,8 @@ int FFT_AddSample(float32_t sample)
         if (fft_processor.state == FFT_STATE_IDLE || fft_processor.state == FFT_STATE_COLLECTING) {
             fft_processor.state = FFT_STATE_READY;
 
-            // Auto process if enabled
-            if (fft_processor.auto_process) {
+            // Auto process if enabled and (not in trigger mode OR triggered)
+            if (fft_processor.auto_process && (!fft_processor.trigger_mode || fft_processor.is_triggered)) {
                 return FFT_Process();
             }
         }
@@ -169,14 +180,21 @@ int FFT_Process(void)
 
     fft_processor.state = FFT_STATE_COMPLETE;
 
-    // 发送高分辨率频域数据 (257点)
-    FFT_SendFullSpectrumViaProtocol();
+    // FFT数据发送已删除 - 调试串口现在专用于调试信息输出
+    // 输出FFT处理完成的调试信息
+    printf("FFT_RESULT: freq=%.2fHz mag=%.6f energy=%.6f samples=%lu\r\n",
+           fft_processor.last_result.dominant_frequency,
+           fft_processor.last_result.dominant_magnitude,
+           fft_processor.last_result.total_energy,
+           fft_processor.last_result.sample_count);
 
-    // 可选：同时发送兼容的21点数据
-    // FFT_SendSpectrumViaProtocol();
-
-    // 同时输出CSV格式（可选）
-    // FFT_PrintSpectrumCSV();
+    // 输出前几个频率点的幅值，用于验证滤波效果
+    printf("FFT_SPECTRUM: 0Hz=%.6f 5Hz=%.6f 10Hz=%.6f 25Hz=%.6f 50Hz=%.6f\r\n",
+           fft_processor.last_result.magnitude_spectrum[0],   // 0Hz (DC)
+           fft_processor.last_result.magnitude_spectrum[3],   // ~5Hz
+           fft_processor.last_result.magnitude_spectrum[5],   // ~10Hz
+           fft_processor.last_result.magnitude_spectrum[13],  // ~25Hz
+           fft_processor.last_result.magnitude_spectrum[26]); // ~50Hz
 
     // Reset for next FFT cycle if auto processing is enabled
     if (fft_processor.auto_process) {
@@ -428,153 +446,67 @@ void FFT_PrintSpectrumCSV(void)
     printf("SPECTRUM_END\r\n");
 }
 
-void FFT_SendSpectrumViaProtocol(void)
+/* --------------------------------------------------------------------------------------
+ *  Stage 3: Intelligent FFT Control Functions
+ * -------------------------------------------------------------------------------------- */
+
+int FFT_SetTriggerMode(bool enable)
 {
-    if (fft_processor.state != FFT_STATE_COMPLETE) {
-        return;  // 静默返回，无调试信息
+    if (!is_initialized) {
+        return -1;
     }
 
-    const fft_result_t* result = &fft_processor.last_result;
+    fft_processor.trigger_mode = enable;
 
-    // 构建协议帧数据
-    uint8_t frame[95];  // 完整帧长度
-    uint16_t index = 0;
-
-    // 帧头: AA 55
-    frame[index++] = 0xAA;
-    frame[index++] = 0x55;
-
-    // 命令码: 01 (频域数据)
-    frame[index++] = 0x01;
-
-    // 长度: 58 00 (88字节载荷，小端序)
-    frame[index++] = 0x58;
-    frame[index++] = 0x00;
-
-    // 时间戳: 当前时间 (小端序)
-    uint32_t timestamp = HAL_GetTick();
-    frame[index++] = (uint8_t)(timestamp & 0xFF);
-    frame[index++] = (uint8_t)((timestamp >> 8) & 0xFF);
-    frame[index++] = (uint8_t)((timestamp >> 16) & 0xFF);
-    frame[index++] = (uint8_t)((timestamp >> 24) & 0xFF);
-
-    // 21个频点的真实频域数据
-    for (uint32_t i = 0; i < 21; i++) {
-        uint32_t freq_hz = i * 25;  // 0, 25, 50, ..., 500Hz
-
-        // 找到最接近目标频率的FFT bin
-        uint32_t bin_index = (uint32_t)((float32_t)freq_hz * FFT_SIZE / SAMPLING_FREQUENCY);
-        if (bin_index >= FFT_OUTPUT_POINTS) {
-            bin_index = FFT_OUTPUT_POINTS - 1;
-        }
-
-        // FFT输出是g单位，转换为mg单位显示
-        float32_t magnitude_mg = result->magnitude_spectrum[bin_index] * 1000.0f;
-
-        // 将float32转换为字节 (小端序)
-        union {
-            float32_t f;
-            uint8_t bytes[4];
-        } float_converter;
-
-        float_converter.f = magnitude_mg;
-
-        frame[index++] = float_converter.bytes[0];
-        frame[index++] = float_converter.bytes[1];
-        frame[index++] = float_converter.bytes[2];
-        frame[index++] = float_converter.bytes[3];
+    if (enable) {
+        // Entering trigger mode: reset FFT state and clear buffer
+        fft_processor.is_triggered = false;
+        FFT_Reset();
     }
 
-    // 计算校验和 (命令码 + 长度 + 载荷)
-    uint8_t checksum = 0;
-    for (int i = 2; i < index; i++) {  // 从命令码开始到载荷结束
-        checksum ^= frame[i];
-    }
-    frame[index++] = checksum;
-
-    // 帧尾: 0D
-    frame[index++] = 0x0D;
-
-    // 发送协议帧 (不发送文本标识，纯二进制)
-    for (int i = 0; i < index; i++) {
-        putchar(frame[i]);
-    }
+    return 0;
 }
 
-void FFT_SendFullSpectrumViaProtocol(void)
+int FFT_SetTriggerState(bool triggered)
 {
-    if (fft_processor.state != FFT_STATE_COMPLETE) {
-        return;  // 静默返回，无调试信息
+    if (!is_initialized) {
+        return -1;
     }
 
-    const fft_result_t* result = &fft_processor.last_result;
+    bool previous_state = fft_processor.is_triggered;
+    fft_processor.is_triggered = triggered;
 
-    // 计算帧长度: 帧头(2) + 命令(1) + 长度(2) + 时间戳(4) + 257个float32(1028) + 校验(1) + 帧尾(1) = 1039字节
-    static uint8_t frame[1039];  // 使用静态缓冲区避免栈溢出
-    uint16_t index = 0;
-
-    // 帧头: AA 55
-    frame[index++] = 0xAA;
-    frame[index++] = 0x55;
-
-    // 命令码: 04 (高分辨率频域数据)
-    frame[index++] = 0x04;
-
-    // 载荷长度: 1032字节 (4字节时间戳 + 257*4字节float32)
-    uint16_t payload_len = 4 + FFT_OUTPUT_POINTS * 4;
-    frame[index++] = (uint8_t)(payload_len & 0xFF);        // 长度低字节
-    frame[index++] = (uint8_t)((payload_len >> 8) & 0xFF); // 长度高字节
-
-    // 时间戳: 当前时间 (小端序)
-    uint32_t timestamp = HAL_GetTick();
-    frame[index++] = (uint8_t)(timestamp & 0xFF);
-    frame[index++] = (uint8_t)((timestamp >> 8) & 0xFF);
-    frame[index++] = (uint8_t)((timestamp >> 16) & 0xFF);
-    frame[index++] = (uint8_t)((timestamp >> 24) & 0xFF);
-
-    // 257个频点的完整频域数据 (0到500Hz)
-    for (uint32_t i = 0; i < FFT_OUTPUT_POINTS; i++) {
-        // FFT输出是g单位，转换为mg单位
-        float32_t magnitude_mg = result->magnitude_spectrum[i] * 1000.0f;
-
-        // 将float32转换为字节 (小端序)
-        union {
-            float32_t f;
-            uint8_t bytes[4];
-        } float_converter;
-
-        float_converter.f = magnitude_mg;
-
-        frame[index++] = float_converter.bytes[0];
-        frame[index++] = float_converter.bytes[1];
-        frame[index++] = float_converter.bytes[2];
-        frame[index++] = float_converter.bytes[3];
+    // If transitioning from not triggered to triggered, reset FFT for fresh data
+    if (!previous_state && triggered) {
+        FFT_Reset();
     }
 
-    // 计算校验和 (命令码 + 长度 + 载荷)
-    uint8_t checksum = 0;
-    for (uint16_t i = 2; i < index; i++) {  // 从命令码开始到载荷结束
-        checksum ^= frame[i];
-    }
-    frame[index++] = checksum;
-
-    // 帧尾: 0D
-    frame[index++] = 0x0D;
-
-    // 分批发送协议帧，避免UART缓冲区溢出
-    const uint16_t chunk_size = 64;  // 每次发送64字节
-    for (uint16_t i = 0; i < index; i += chunk_size) {
-        uint16_t remaining = index - i;
-        uint16_t send_size = (remaining > chunk_size) ? chunk_size : remaining;
-
-        for (uint16_t j = 0; j < send_size; j++) {
-            putchar(frame[i + j]);
-        }
-
-        // 短暂延迟，确保UART传输完成
-        for (volatile int delay = 0; delay < 1000; delay++);
-    }
+    return 0;
 }
+
+bool FFT_GetTriggerState(void)
+{
+    return fft_processor.is_triggered;
+}
+
+bool FFT_ShouldProcess(void)
+{
+    if (!is_initialized) {
+        return false;
+    }
+
+    // If not in trigger mode, always process
+    if (!fft_processor.trigger_mode) {
+        return true;
+    }
+
+    // In trigger mode: only process if triggered
+    return fft_processor.is_triggered;
+}
+
+/* FFT数据发送函数已删除 - 调试串口现在专用于调试信息输出 */
+
+/* FFT完整频谱数据发送函数已删除 - 调试串口现在专用于调试信息输出 */
 
 // Print spectrum in format similar to reference chart
 void FFT_PrintSpectrumChart(void)

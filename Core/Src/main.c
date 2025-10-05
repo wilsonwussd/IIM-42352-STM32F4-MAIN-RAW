@@ -20,7 +20,8 @@
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
 #include "clock_config_84mhz.h"  // 84MHz时钟配置验证
-#include <stdio.h> // <--- ?????
+#include <stdio.h>
+#include <string.h>  // For strlen
 #include "example-raw-data.h"
 /* InvenSense utils */
 #include "Message.h"
@@ -183,15 +184,24 @@ enum gpio_inv_pin_num {
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
 
-#if !defined(__ARMCC_VERSION) && defined(__GNUC__) 
-  #define PUTCHAR_PROTOTYPE int __io_putchar(int ch)
-#else
-  #define PUTCHAR_PROTOTYPE int fputc(int ch, FILE *f)
-#endif
-PUTCHAR_PROTOTYPE
+// 简化的printf重定向 - 支持Keil和GCC
+int fputc(int ch, FILE *f)
 {
-  HAL_UART_Transmit(&huart1, (uint8_t *)&ch, 1, 0xFFFF);
+  HAL_UART_Transmit(&huart1, (uint8_t *)&ch, 1, 1000);
   return ch;
+}
+
+int __io_putchar(int ch)
+{
+  HAL_UART_Transmit(&huart1, (uint8_t *)&ch, 1, 1000);
+  return ch;
+}
+
+// 系统调用重定向
+int _write(int file, char *ptr, int len)
+{
+  HAL_UART_Transmit(&huart1, (uint8_t *)ptr, len, 1000);
+  return len;
 }
 /* USER CODE END 0 */
 
@@ -228,8 +238,39 @@ int main(void)
   MX_USART1_UART_Init();
   MX_UART5_Init();
 //  /* USER CODE BEGIN 2 */
-  printf("\nIIM42352 SPI Test - 84MHz Configuration\n");
+
+  // 强制延迟确保UART完全初始化
+  HAL_Delay(100);
+
+  // 多重UART测试
+  const char test_msg1[] = "\r\n\r\n=== SYSTEM BOOT START ===\r\n";
+  HAL_UART_Transmit(&huart1, (uint8_t*)test_msg1, strlen(test_msg1), 1000);
+  HAL_Delay(50);
+
+  const char test_msg2[] = "UART1 Direct HAL transmission OK\r\n";
+  HAL_UART_Transmit(&huart1, (uint8_t*)test_msg2, strlen(test_msg2), 1000);
+  HAL_Delay(50);
+
+  // 测试printf
+  printf("Printf redirection test OK\r\n");
+  HAL_Delay(50);
+
+  printf("=== IIM42352 Intelligent Detection System ===\r\n");
+  printf("Version: v4.0-dev (Stage 3 - Intelligent FFT Control)\r\n");
+  HAL_Delay(50);
+  printf("Version: v4.0-dev (Stage 1 Verification)\n");
   printf("Bolgen Studio\n");
+
+#if ENABLE_INTELLIGENT_DETECTION
+  printf("INTELLIGENT DETECTION: ENABLED\n");
+#if ENABLE_DATA_PREPROCESSING
+  printf("DATA PREPROCESSING: ENABLED (5Hz Highpass Filter)\n");
+#else
+  printf("DATA PREPROCESSING: DISABLED\n");
+#endif
+#else
+  printf("INTELLIGENT DETECTION: DISABLED (Legacy Mode)\n");
+#endif
 
   /* 84MHz时钟配置验证和性能测试 */
   Full_84MHz_Test();
@@ -265,6 +306,16 @@ int main(void)
 	if (rc != 0) {
 		while(1);  // 初始化失败，停止运行
 	}
+
+#if ENABLE_COARSE_DETECTION
+	/* 启用FFT触发模式 (阶段3) */
+	rc = FFT_SetTriggerMode(true);
+	if(rc != 0) {
+		printf("!!! ERROR : failed to enable FFT trigger mode.\r\n");
+		while(1);  // 触发模式启用失败，停止运行
+	}
+	printf("=== FFT TRIGGER MODE ENABLED ===\r\n");
+#endif
 
 	/* Skip FFT Tests for production */
 	// FFT_RunAllTests();
@@ -950,14 +1001,8 @@ void Simple_Protocol_Test(void)
     // 帧尾: 0D
     frame[index++] = 0x0D;
 
-    // 发送协议帧
-    printf("PROTOCOL_FRAME_START\r\n");
-
-    for (int i = 0; i < index; i++) {
-        putchar(frame[i]);
-    }
-
-    printf("PROTOCOL_FRAME_END\r\n");
+    // 协议帧发送已删除 - 仅输出调试信息
+    printf("DEBUG: Protocol frame prepared (%d bytes) - not sent\r\n", index);
 }
 
 /**
@@ -1179,15 +1224,13 @@ void Process_UART1_Command(void)
 }
 
 /**
- * @brief Send response to PC via UART1
+ * @brief Send response to PC via UART1 (现在仅输出调试信息)
  * @param message: Message to send
  */
 void Send_Response_To_PC(const char *message)
 {
-    char response[128];
-    snprintf(response, sizeof(response), "RESPONSE:%s\n", message);
-    HAL_UART_Transmit(&huart1, (uint8_t*)response, strlen(response), 1000);
-    printf("Sent to PC: %s", response);
+    // 不再发送协议数据，仅输出调试信息
+    printf("DEBUG: Response message: %s\r\n", message);
 }
 
 /**
