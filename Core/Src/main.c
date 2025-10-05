@@ -256,7 +256,7 @@ int main(void)
   HAL_Delay(50);
 
   printf("=== IIM42352 Intelligent Detection System ===\r\n");
-  printf("Version: v4.0-dev (Stage 3 - Intelligent FFT Control)\r\n");
+  printf("Version: v4.0-dev (Stage 5 - System State Machine)\r\n");
   HAL_Delay(50);
   printf("Version: v4.0-dev (Stage 1 Verification)\n");
   printf("Bolgen Studio\n");
@@ -317,6 +317,26 @@ int main(void)
 	printf("=== FFT TRIGGER MODE ENABLED ===\r\n");
 #endif
 
+#if ENABLE_FINE_DETECTION
+	/* 初始化细检测算法 (阶段4) */
+	rc = Fine_Detector_Init();
+	if(rc != 0) {
+		printf("!!! ERROR : failed to initialize fine detector.\r\n");
+		while(1);  // 细检测初始化失败，停止运行
+	}
+	printf("=== FINE DETECTION ENABLED ===\r\n");
+#endif
+
+#if ENABLE_SYSTEM_STATE_MACHINE
+	/* 初始化系统状态机 (阶段5) */
+	rc = System_State_Machine_Init();
+	if(rc != 0) {
+		printf("!!! ERROR : failed to initialize system state machine.\r\n");
+		while(1);  // 状态机初始化失败，停止运行
+	}
+	printf("=== SYSTEM STATE MACHINE ENABLED ===\r\n");
+#endif
+
 	/* Skip FFT Tests for production */
 	// FFT_RunAllTests();
 
@@ -365,6 +385,11 @@ int main(void)
 
 		/* Process alarm state machine */
 		Process_Alarm_State_Machine();
+
+#if ENABLE_SYSTEM_STATE_MACHINE
+		/* Process system state machine (阶段5) */
+		System_State_Machine_Process();
+#endif
 
 		/* 协议测试 - 每10秒发送一次测试数据 (可选) */
 		static uint32_t last_test_time = 0;
@@ -1115,10 +1140,20 @@ void Process_Alarm_State_Machine(void)
                 alarm_hold_start_time = HAL_GetTick();
                 alarm_state = ALARM_STATE_HOLD;
                 Send_Response_To_PC("ALARM_SET_SUCCESS");
+
+                // 通知系统状态机报警发送进行中
+                #if ENABLE_SYSTEM_STATE_MACHINE
+                System_State_Machine_SetAlarmStatus(0);  // 进行中
+                #endif
             } else if ((HAL_GetTick() - lora_timeout_start_time) > LORA_TIMEOUT_MS) {
                 printf("Timeout waiting for response to set 1\n");
                 alarm_state = ALARM_STATE_IDLE;
                 Send_Response_To_PC("ALARM_SET_TIMEOUT");
+
+                // 通知系统状态机报警发送失败
+                #if ENABLE_SYSTEM_STATE_MACHINE
+                System_State_Machine_SetAlarmStatus(2);  // 失败
+                #endif
             }
             break;
 
@@ -1152,10 +1187,20 @@ void Process_Alarm_State_Machine(void)
                 // 进入完成状态
                 alarm_state = ALARM_STATE_COMPLETE;
                 Send_Response_To_PC("ALARM_RESET_SUCCESS");
+
+                // 通知系统状态机报警发送成功
+                #if ENABLE_SYSTEM_STATE_MACHINE
+                System_State_Machine_SetAlarmStatus(1);  // 成功
+                #endif
             } else if ((HAL_GetTick() - lora_timeout_start_time) > LORA_TIMEOUT_MS) {
                 printf("Timeout waiting for response to set 0\n");
                 alarm_state = ALARM_STATE_IDLE;
                 Send_Response_To_PC("ALARM_RESET_TIMEOUT");
+
+                // 通知系统状态机报警发送失败
+                #if ENABLE_SYSTEM_STATE_MACHINE
+                System_State_Machine_SetAlarmStatus(2);  // 失败
+                #endif
             }
             break;
 

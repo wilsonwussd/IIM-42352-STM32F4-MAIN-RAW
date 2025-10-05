@@ -1,0 +1,38 @@
+From 80baa149cbc49f8df94ce31f2bd798450a026ba6 Mon Sep 17 00:00:00 2001
+From: STM32 Vibration Analyzer <vibration.analyzer@example.com>
+Date: Sun, 5 Oct 2025 23:42:48 +0800
+Subject: [PATCH 2/2] =?UTF-8?q?=F0=9F=93=9D=20Update=20.gitignore=20for=20?=
+ =?UTF-8?q?v4.0=20development=20files?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- Add build output files exclusion
+- Add development scripts exclusion
+- Clean up repository structure
+---
+ .gitignore | 8 ++++++++
+ 1 file changed, 8 insertions(+)
+
+diff --git a/.gitignore b/.gitignore
+index 28624c6..032b534 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -118,6 +118,14 @@ Thumbs.db
+ # Log files
+ *.log
+ 
++# Build output files (v4.0 development)
++MDK-ARM/build_output*.txt
++
++# Development scripts (v4.0)
++fix_filter_coeffs.py
++generate_correct_coeffs.py
++verify_filter_coeffs.py
++
+ # Temporary files
+ *.tmp
+ *.temp
+-- 
+2.50.1.windows.1
+

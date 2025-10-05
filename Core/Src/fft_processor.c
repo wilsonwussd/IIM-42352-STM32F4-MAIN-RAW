@@ -11,6 +11,9 @@
 #include <string.h>
 #include <math.h>
 
+/* Include header with macro definitions */
+#include "example-raw-data.h"  // For ENABLE_FINE_DETECTION macro and fine detection functions
+
 /* External function declaration to avoid header conflicts */
 extern uint32_t HAL_GetTick(void);
 
@@ -187,6 +190,21 @@ int FFT_Process(void)
            fft_processor.last_result.dominant_magnitude,
            fft_processor.last_result.total_energy,
            fft_processor.last_result.sample_count);
+
+#if ENABLE_FINE_DETECTION
+    // 阶段4：细检测算法处理
+    fine_detection_features_t fine_features;
+    int fine_result = Fine_Detector_Process(fft_processor.last_result.magnitude_spectrum,
+                                           FFT_OUTPUT_POINTS,
+                                           fft_processor.last_result.dominant_frequency,
+                                           &fine_features);
+
+    if (fine_result == 0 && fine_features.is_valid) {
+        Fine_Detector_PrintResults(&fine_features);
+    } else {
+        printf("FINE_DEBUG: result=%d valid=%d\r\n", fine_result, fine_features.is_valid);
+    }
+#endif
 
     // 输出前几个频率点的幅值，用于验证滤波效果
     printf("FFT_SPECTRUM: 0Hz=%.6f 5Hz=%.6f 10Hz=%.6f 25Hz=%.6f 50Hz=%.6f\r\n",

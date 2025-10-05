@@ -27,6 +27,8 @@
 #define ENABLE_INTELLIGENT_DETECTION  1
 #define ENABLE_DATA_PREPROCESSING     1
 #define ENABLE_COARSE_DETECTION       1
+#define ENABLE_FINE_DETECTION         1
+#define ENABLE_SYSTEM_STATE_MACHINE   1
 
 #if ENABLE_DATA_PREPROCESSING
 /* 高通滤波器配置 */
@@ -46,8 +48,8 @@ typedef struct {
 #if ENABLE_COARSE_DETECTION
 /* 粗检测算法配置 */
 #define RMS_WINDOW_SIZE          200     // RMS滑动窗口大小 (200ms @ 1000Hz)
-#define BASELINE_RMS_THRESHOLD   0.003f  // 基线RMS阈值 (3mg)
-#define TRIGGER_MULTIPLIER       3.0f    // 触发倍数 (3.0x基线)
+#define BASELINE_RMS_THRESHOLD   0.001f  // 基线RMS阈值 (降低到1mg用于调试)
+#define TRIGGER_MULTIPLIER       1.5f    // 触发倍数 (降低到1.5x用于调试)
 #define TRIGGER_DURATION_MS      2000    // 触发持续时间 (2000ms)
 #define COOLDOWN_TIME_MS         10000   // 冷却时间 (10000ms)
 
@@ -206,5 +208,135 @@ coarse_detection_state_t Coarse_Detector_GetState(void);
 void Coarse_Detector_Reset(void);
 #endif
 
+#if ENABLE_FINE_DETECTION
+/* 细检测算法配置 */
+#define FINE_DETECTION_LOW_FREQ_MIN    5.0f     // 低频段下限 (Hz)
+#define FINE_DETECTION_LOW_FREQ_MAX    15.0f    // 低频段上限 (Hz)
+#define FINE_DETECTION_MID_FREQ_MIN    15.0f    // 中频段下限 (Hz)
+#define FINE_DETECTION_MID_FREQ_MAX    30.0f    // 中频段上限 (Hz)
+#define FINE_DETECTION_HIGH_FREQ_MIN   30.0f    // 高频段下限 (Hz)
+#define FINE_DETECTION_HIGH_FREQ_MAX   100.0f   // 高频段上限 (Hz)
+
+/* 分类阈值配置 */
+#define FINE_DETECTION_LOW_FREQ_THRESHOLD     0.4f    // 低频能量阈值
+#define FINE_DETECTION_MID_FREQ_THRESHOLD     0.2f    // 中频能量阈值
+#define FINE_DETECTION_DOMINANT_FREQ_MAX      50.0f   // 主频上限 (Hz)
+#define FINE_DETECTION_CENTROID_MAX           80.0f   // 频谱重心上限 (Hz)
+#define FINE_DETECTION_CONFIDENCE_THRESHOLD   0.7f    // 置信度阈值
+
+/* 分类结果定义 */
+typedef enum {
+    FINE_DETECTION_NORMAL = 0,    // 正常/环境干扰
+    FINE_DETECTION_MINING = 1     // 挖掘震动
+} fine_detection_result_t;
+
+/* 细检测特征结构 */
+typedef struct {
+    // 5维频域特征
+    float32_t low_freq_energy;       // 低频能量占比 (5-15Hz)
+    float32_t mid_freq_energy;       // 中频能量占比 (15-30Hz)
+    float32_t high_freq_energy;      // 高频能量占比 (30-100Hz)
+    float32_t dominant_frequency;    // 主频 (Hz)
+    float32_t spectral_centroid;     // 频谱重心 (Hz)
+
+    // 分类结果
+    fine_detection_result_t classification; // 分类结果
+    float32_t confidence_score;      // 置信度分数 (0-1)
+
+    // 性能统计
+    uint32_t analysis_timestamp;     // 分析时间戳
+    uint32_t computation_time_us;    // 计算时间 (微秒)
+
+    // 状态标志
+    bool is_valid;                   // 结果有效性
+} fine_detection_features_t;
+
+/**
+ * \brief Initialize fine detection algorithm
+ *
+ * \return 0 on success, negative value on error
+ */
+int Fine_Detector_Init(void);
+
+/**
+ * \brief Process FFT spectrum data for fine detection
+ *
+ * \param magnitude_spectrum: FFT magnitude spectrum array
+ * \param spectrum_length: Length of spectrum array (should be 257)
+ * \param dominant_freq: Dominant frequency from FFT analysis
+ * \param features: Output structure for extracted features and classification
+ * \return 0 on success, negative value on error
+ */
+int Fine_Detector_Process(const float32_t* magnitude_spectrum,
+                         uint32_t spectrum_length,
+                         float32_t dominant_freq,
+                         fine_detection_features_t* features);
+
+/**
+ * \brief Print fine detection results
+ *
+ * \param features: Fine detection features and results
+ */
+void Fine_Detector_PrintResults(const fine_detection_features_t* features);
+#endif
+
+#if ENABLE_SYSTEM_STATE_MACHINE
+/* 阶段5：系统状态机定义 */
+
+/* 系统状态枚举 */
+typedef enum {
+    STATE_SYSTEM_INIT = 0,           // 系统初始化
+    STATE_IDLE_SLEEP,                // 深度休眠
+    STATE_MONITORING,                // 监测模式
+    STATE_COARSE_TRIGGERED,          // 粗检测触发
+    STATE_FINE_ANALYSIS,             // 细检测分析
+    STATE_MINING_DETECTED,           // 挖掘检测
+    STATE_ALARM_SENDING,             // 报警发送
+    STATE_ALARM_COMPLETE,            // 报警完成
+    STATE_ERROR_HANDLING,            // 错误处理
+    STATE_SYSTEM_RESET,              // 系统重置
+    STATE_COUNT                      // 状态总数
+} system_state_t;
+
+/* 状态机结构体 */
+typedef struct {
+    system_state_t current_state;    // 当前状态
+    system_state_t previous_state;   // 前一状态
+    uint32_t state_enter_time;       // 状态进入时间
+    uint32_t state_duration;         // 状态持续时间
+
+    // 状态转换条件
+    uint8_t coarse_trigger_flag;     // 粗检测触发标志
+    uint8_t fine_analysis_result;    // 细检测结果 (0=无效, 1=正常, 2=挖掘)
+    uint8_t alarm_send_status;       // 报警发送状态
+    uint8_t error_code;              // 错误代码
+
+    // 状态统计
+    uint32_t state_count[STATE_COUNT];  // 各状态计数
+    uint32_t transition_count;       // 状态转换计数
+
+    // 检测统计
+    uint32_t total_detections;       // 总检测次数
+    uint32_t mining_detections;      // 挖掘检测次数
+    uint32_t false_alarms;           // 误报次数
+} system_state_machine_t;
+
+/* 状态机配置参数 */
+#define STATE_MONITORING_TIMEOUT_MS     30000   // 监测状态超时 (30秒)
+#define STATE_FINE_ANALYSIS_TIMEOUT_MS  5000    // 细检测分析超时 (5秒)
+#define STATE_ALARM_SENDING_TIMEOUT_MS  10000   // 报警发送超时 (10秒)
+#define STATE_ERROR_RECOVERY_DELAY_MS   1000    // 错误恢复延迟 (1秒)
+
+/* 函数声明 */
+int System_State_Machine_Init(void);
+void System_State_Machine_Process(void);
+void System_State_Machine_SetCoarseTrigger(uint8_t triggered);
+void System_State_Machine_SetFineResult(uint8_t result);
+void System_State_Machine_SetAlarmStatus(uint8_t status);
+void System_State_Machine_SetError(uint8_t error_code);
+system_state_t System_State_Machine_GetCurrentState(void);
+void System_State_Machine_PrintStatus(void);
+
+#endif
 
 #endif /* !_EXAMPLE_RAW_AG_H_ */

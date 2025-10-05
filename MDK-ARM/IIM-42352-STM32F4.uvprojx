@@ -409,6 +409,11 @@
               <FileType>1</FileType>
               <FilePath>..\Core\Src\example-raw-data.c</FilePath>
             </File>
+            <File>
+              <FileName>clock_config_84mhz.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\Core\Src\clock_config_84mhz.c</FilePath>
+            </File>
           </Files>
         </Group>
         <Group>

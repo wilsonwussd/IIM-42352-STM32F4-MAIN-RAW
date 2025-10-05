@@ -56,6 +56,32 @@ static highpass_filter_t z_axis_filter;
 static coarse_detector_t coarse_detector;
 #endif
 
+#if ENABLE_FINE_DETECTION
+/* 细检测算法实例 */
+static bool fine_detector_initialized = false;
+#endif
+
+#if ENABLE_SYSTEM_STATE_MACHINE
+/* 阶段5：系统状态机全局变量 */
+static system_state_machine_t g_state_machine;
+static uint8_t state_machine_initialized = 0;
+
+/* 状态名称字符串 (用于调试输出) */
+static const char* state_names[STATE_COUNT] = {
+    "SYSTEM_INIT",
+    "IDLE_SLEEP",
+    "MONITORING",
+    "COARSE_TRIGGERED",
+    "FINE_ANALYSIS",
+    "MINING_DETECTED",
+    "ALARM_SENDING",
+    "ALARM_COMPLETE",
+    "ERROR_HANDLING",
+    "SYSTEM_RESET"
+};
+
+#endif
+
 #if ENABLE_DATA_PREPROCESSING
 /* 4阶Butterworth高通滤波器系数 (5Hz截止频率, 1000Hz采样频率) */
 /* 使用scipy.signal.butter计算，转换为CMSIS DSP格式 */
@@ -300,8 +326,19 @@ void HandleInvDeviceFifoPacket(inv_iim423xx_sensor_event_t * event)
 		int trigger_detected = Coarse_Detector_Process(filtered_z_g);
 
 		// 阶段3：使用FFT触发控制
-		bool should_trigger = (trigger_detected || Coarse_Detector_GetState() == COARSE_STATE_TRIGGERED);
+		// FFT应该在TRIGGERED和COOLDOWN状态下都保持激活
+		coarse_detection_state_t current_state = Coarse_Detector_GetState();
+		bool should_trigger = (trigger_detected ||
+		                      current_state == COARSE_STATE_TRIGGERED ||
+		                      current_state == COARSE_STATE_COOLDOWN);
 		FFT_SetTriggerState(should_trigger);
+
+		// 调试输出FFT触发状态
+		static uint32_t fft_debug_counter = 0;
+		fft_debug_counter++;
+		if (fft_debug_counter % 1000 == 0) {
+			printf("FFT_DEBUG: should_trigger=%d state=%d\r\n", should_trigger, current_state);
+		}
 
 		// FFT处理现在由触发状态自动控制
 		int result = FFT_AddSample(filtered_z_g);
@@ -488,6 +525,9 @@ int Coarse_Detector_Init(void)
 
 int Coarse_Detector_Process(float32_t filtered_sample)
 {
+    static uint32_t debug_counter = 0;
+    debug_counter++;
+
     if (!coarse_detector.is_initialized) {
         return 0;
     }
@@ -498,6 +538,7 @@ int Coarse_Detector_Process(float32_t filtered_sample)
 
     if (!coarse_detector.window_full && coarse_detector.window_index == 0) {
         coarse_detector.window_full = true;
+        printf("COARSE_DEBUG: RMS window is now full, detection active\r\n");
     }
 
     // 计算当前RMS (仅在窗口满后)
@@ -511,6 +552,13 @@ int Coarse_Detector_Process(float32_t filtered_sample)
         // 计算峰值因子
         coarse_detector.peak_factor = coarse_detector.current_rms / coarse_detector.baseline_rms;
 
+        // 每1000个样本输出一次调试信息
+        if (debug_counter % 1000 == 0) {
+            printf("COARSE_DEBUG: RMS=%.6f baseline=%.6f peak_factor=%.2f state=%d\r\n",
+                   coarse_detector.current_rms, coarse_detector.baseline_rms,
+                   coarse_detector.peak_factor, coarse_detector.state);
+        }
+
         // 状态机处理
         uint32_t current_time = HAL_GetTick();
 
@@ -520,6 +568,14 @@ int Coarse_Detector_Process(float32_t filtered_sample)
                     coarse_detector.state = COARSE_STATE_TRIGGERED;
                     coarse_detector.trigger_start_time = current_time;
                     coarse_detector.trigger_count++;
+                    printf("COARSE_TRIGGER: RMS=%.6f peak_factor=%.2f TRIGGERED!\r\n",
+                           coarse_detector.current_rms, coarse_detector.peak_factor);
+
+                    // 通知状态机粗检测触发
+                    #if ENABLE_SYSTEM_STATE_MACHINE
+                    System_State_Machine_SetCoarseTrigger(1);
+                    #endif
+
                     return 1;  // 触发检测到
                 }
                 break;
@@ -558,5 +614,567 @@ void Coarse_Detector_Reset(void)
         memset(coarse_detector.rms_window, 0, sizeof(coarse_detector.rms_window));
     }
 }
+#endif
+
+#if ENABLE_FINE_DETECTION
+/* --------------------------------------------------------------------------------------
+ *  细检测算法实现 - 基于5维频域特征提取和规则分类器
+ * -------------------------------------------------------------------------------------- */
+
+int Fine_Detector_Init(void)
+{
+    fine_detector_initialized = true;
+    printf("=== FINE DETECTION INITIALIZED ===\r\n");
+    return 0;
+}
+
+static float32_t calculate_frequency_bin_energy(const float32_t* magnitude_spectrum,
+                                               uint32_t spectrum_length,
+                                               float32_t freq_min,
+                                               float32_t freq_max)
+{
+    // FFT配置：采样频率1000Hz，FFT大小512，频率分辨率1.953125Hz
+    const float32_t freq_resolution = 1000.0f / 512.0f;  // 1.953125 Hz
+
+    // 计算频段对应的bin索引
+    uint32_t bin_min = (uint32_t)(freq_min / freq_resolution);
+    uint32_t bin_max = (uint32_t)(freq_max / freq_resolution);
+
+    // 限制在有效范围内
+    if (bin_min >= spectrum_length) bin_min = spectrum_length - 1;
+    if (bin_max >= spectrum_length) bin_max = spectrum_length - 1;
+    if (bin_max < bin_min) bin_max = bin_min;
+
+    // 计算频段能量 (幅度平方和)
+    float32_t energy = 0.0f;
+    for (uint32_t i = bin_min; i <= bin_max; i++) {
+        energy += magnitude_spectrum[i] * magnitude_spectrum[i];
+    }
+
+    return energy;
+}
+
+static float32_t calculate_total_energy(const float32_t* magnitude_spectrum,
+                                       uint32_t spectrum_length)
+{
+    float32_t total_energy = 0.0f;
+
+    // 跳过DC分量 (bin 0)，从bin 1开始计算
+    for (uint32_t i = 1; i < spectrum_length; i++) {
+        total_energy += magnitude_spectrum[i] * magnitude_spectrum[i];
+    }
+
+    return total_energy;
+}
+
+static float32_t calculate_spectral_centroid(const float32_t* magnitude_spectrum,
+                                            uint32_t spectrum_length)
+{
+    const float32_t freq_resolution = 1000.0f / 512.0f;  // 1.953125 Hz
+
+    float32_t weighted_sum = 0.0f;
+    float32_t magnitude_sum = 0.0f;
+
+    // 跳过DC分量，从bin 1开始计算
+    for (uint32_t i = 1; i < spectrum_length; i++) {
+        float32_t frequency = i * freq_resolution;
+        float32_t magnitude_squared = magnitude_spectrum[i] * magnitude_spectrum[i];
+
+        weighted_sum += frequency * magnitude_squared;
+        magnitude_sum += magnitude_squared;
+    }
+
+    // 避免除零
+    if (magnitude_sum < 1e-10f) {
+        return 0.0f;
+    }
+
+    return weighted_sum / magnitude_sum;
+}
+
+static float32_t calculate_confidence_score(const fine_detection_features_t* features)
+{
+    // 规则权重
+    const float32_t w_low = 0.4f;    // 低频能量权重
+    const float32_t w_mid = 0.2f;    // 中频能量权重
+    const float32_t w_dom = 0.2f;    // 主频权重
+    const float32_t w_cent = 0.2f;   // 频谱重心权重
+
+    // 计算各项得分 (0-1范围)
+    float32_t low_freq_score = (features->low_freq_energy > FINE_DETECTION_LOW_FREQ_THRESHOLD) ?
+                               (features->low_freq_energy / FINE_DETECTION_LOW_FREQ_THRESHOLD) : 0.0f;
+    if (low_freq_score > 1.0f) low_freq_score = 1.0f;
+
+    float32_t mid_freq_score = 1.0f - fabsf(features->mid_freq_energy - FINE_DETECTION_MID_FREQ_THRESHOLD) / FINE_DETECTION_MID_FREQ_THRESHOLD;
+    if (mid_freq_score < 0.0f) mid_freq_score = 0.0f;
+
+    float32_t dominant_freq_score = (features->dominant_frequency < FINE_DETECTION_DOMINANT_FREQ_MAX) ?
+                                   (FINE_DETECTION_DOMINANT_FREQ_MAX - features->dominant_frequency) / FINE_DETECTION_DOMINANT_FREQ_MAX : 0.0f;
+
+    float32_t centroid_score = (features->spectral_centroid < FINE_DETECTION_CENTROID_MAX) ?
+                              (FINE_DETECTION_CENTROID_MAX - features->spectral_centroid) / FINE_DETECTION_CENTROID_MAX : 0.0f;
+
+    // 加权计算总置信度
+    float32_t confidence = w_low * low_freq_score +
+                          w_mid * mid_freq_score +
+                          w_dom * dominant_freq_score +
+                          w_cent * centroid_score;
+
+    // 限制在0-1范围内
+    if (confidence < 0.0f) confidence = 0.0f;
+    if (confidence > 1.0f) confidence = 1.0f;
+
+    return confidence;
+}
+
+int Fine_Detector_Process(const float32_t* magnitude_spectrum,
+                         uint32_t spectrum_length,
+                         float32_t dominant_freq,
+                         fine_detection_features_t* features)
+{
+    if (!fine_detector_initialized || !magnitude_spectrum || !features || spectrum_length != 257) {
+        return -1;
+    }
+
+    uint32_t start_time = HAL_GetTick();
+
+    // 清零输出结构
+    memset(features, 0, sizeof(fine_detection_features_t));
+
+    // 计算总能量
+    float32_t total_energy = calculate_total_energy(magnitude_spectrum, spectrum_length);
+
+    // 避免除零
+    if (total_energy < 1e-10f) {
+        features->is_valid = false;
+        return 0;
+    }
+
+    // 1. 计算低频能量占比 (5-15Hz)
+    float32_t low_freq_energy = calculate_frequency_bin_energy(magnitude_spectrum, spectrum_length,
+                                                              FINE_DETECTION_LOW_FREQ_MIN,
+                                                              FINE_DETECTION_LOW_FREQ_MAX);
+    features->low_freq_energy = low_freq_energy / total_energy;
+
+    // 2. 计算中频能量占比 (15-30Hz)
+    float32_t mid_freq_energy = calculate_frequency_bin_energy(magnitude_spectrum, spectrum_length,
+                                                              FINE_DETECTION_MID_FREQ_MIN,
+                                                              FINE_DETECTION_MID_FREQ_MAX);
+    features->mid_freq_energy = mid_freq_energy / total_energy;
+
+    // 3. 计算高频能量占比 (30-100Hz)
+    float32_t high_freq_energy = calculate_frequency_bin_energy(magnitude_spectrum, spectrum_length,
+                                                               FINE_DETECTION_HIGH_FREQ_MIN,
+                                                               FINE_DETECTION_HIGH_FREQ_MAX);
+    features->high_freq_energy = high_freq_energy / total_energy;
+
+    // 4. 主频 (直接使用FFT结果)
+    features->dominant_frequency = dominant_freq;
+
+    // 5. 计算频谱重心
+    features->spectral_centroid = calculate_spectral_centroid(magnitude_spectrum, spectrum_length);
+
+    // 计算置信度
+    features->confidence_score = calculate_confidence_score(features);
+
+    // 分类决策
+    features->classification = (features->confidence_score >= FINE_DETECTION_CONFIDENCE_THRESHOLD) ?
+                              FINE_DETECTION_MINING : FINE_DETECTION_NORMAL;
+
+    // 性能统计
+    features->analysis_timestamp = HAL_GetTick();
+    features->computation_time_us = (features->analysis_timestamp - start_time) * 1000;  // 转换为微秒
+    features->is_valid = true;
+
+    // 通知状态机细检测结果
+    #if ENABLE_SYSTEM_STATE_MACHINE
+    uint8_t result = (features->classification == FINE_DETECTION_MINING) ? 2 : 1;
+    System_State_Machine_SetFineResult(result);
+    #endif
+
+    return 0;
+}
+
+void Fine_Detector_PrintResults(const fine_detection_features_t* features)
+{
+    if (!features || !features->is_valid) {
+        return;
+    }
+
+    // 输出细检测结果
+    printf("FINE_DETECTION: class=%s conf=%.2f low=%.2f mid=%.2f high=%.2f centroid=%.1fHz\r\n",
+           (features->classification == FINE_DETECTION_MINING) ? "MINING" : "NORMAL",
+           features->confidence_score,
+           features->low_freq_energy,
+           features->mid_freq_energy,
+           features->high_freq_energy,
+           features->spectral_centroid);
+}
+#endif
+
+#if ENABLE_SYSTEM_STATE_MACHINE
+/* 阶段5：系统状态机实现 */
+
+/**
+ * @brief 状态转换函数
+ * @param new_state: 新状态
+ */
+static void transition_to_state(system_state_t new_state)
+{
+    if (new_state >= STATE_COUNT) {
+        printf("STATE_ERROR: Invalid state %d\r\n", new_state);
+        return;
+    }
+
+    // 记录状态转换
+    g_state_machine.previous_state = g_state_machine.current_state;
+    g_state_machine.current_state = new_state;
+    g_state_machine.state_enter_time = HAL_GetTick();
+    g_state_machine.transition_count++;
+    g_state_machine.state_count[new_state]++;
+
+    // 调试输出
+    printf("STATE_TRANSITION: %s -> %s (transition #%lu)\r\n",
+           state_names[g_state_machine.previous_state],
+           state_names[new_state],
+           g_state_machine.transition_count);
+}
+
+/**
+ * @brief 系统初始化状态处理
+ */
+static void handle_system_init(void)
+{
+    // 系统初始化完成，进入监测模式
+    transition_to_state(STATE_MONITORING);
+}
+
+/**
+ * @brief 深度休眠状态处理
+ */
+static void handle_idle_sleep(void)
+{
+    // 深度休眠逻辑 (阶段6实现)
+    // 当前直接进入监测模式
+    transition_to_state(STATE_MONITORING);
+}
+
+/**
+ * @brief 监测模式状态处理
+ */
+static void handle_monitoring(void)
+{
+    // 检查粗检测触发
+    if (g_state_machine.coarse_trigger_flag) {
+        g_state_machine.coarse_trigger_flag = 0;  // 清除标志
+        transition_to_state(STATE_COARSE_TRIGGERED);
+        return;
+    }
+
+    // 监测超时检查 (可选)
+    uint32_t current_time = HAL_GetTick();
+    if (current_time - g_state_machine.state_enter_time > STATE_MONITORING_TIMEOUT_MS) {
+        // 长时间无活动，可以考虑进入休眠 (阶段6实现)
+        // 当前重置状态进入时间
+        g_state_machine.state_enter_time = current_time;
+    }
+}
+
+/**
+ * @brief 粗检测触发状态处理
+ */
+static void handle_coarse_triggered(void)
+{
+    // 粗检测触发后，等待细检测结果
+    transition_to_state(STATE_FINE_ANALYSIS);
+}
+
+/**
+ * @brief 细检测分析状态处理
+ */
+static void handle_fine_analysis(void)
+{
+    // 检查细检测结果
+    if (g_state_machine.fine_analysis_result != 0) {
+        if (g_state_machine.fine_analysis_result == 2) {
+            // 检测到挖掘震动
+            g_state_machine.total_detections++;
+            g_state_machine.mining_detections++;
+            transition_to_state(STATE_MINING_DETECTED);
+        } else {
+            // 正常震动，返回监测模式
+            g_state_machine.total_detections++;
+            transition_to_state(STATE_MONITORING);
+        }
+        g_state_machine.fine_analysis_result = 0;  // 清除结果
+        return;
+    }
+
+    // 超时检查
+    uint32_t current_time = HAL_GetTick();
+    if (current_time - g_state_machine.state_enter_time > STATE_FINE_ANALYSIS_TIMEOUT_MS) {
+        printf("STATE_WARNING: Fine analysis timeout, returning to monitoring\r\n");
+        transition_to_state(STATE_MONITORING);
+    }
+}
+
+/**
+ * @brief 挖掘检测状态处理
+ */
+static void handle_mining_detected(void)
+{
+    printf("STATE_INFO: Mining vibration detected! Triggering alarm...\r\n");
+
+    // 触发报警 (集成现有的报警状态机)
+    extern void Trigger_Alarm_Cycle(void);
+    Trigger_Alarm_Cycle();
+
+    transition_to_state(STATE_ALARM_SENDING);
+}
+
+/**
+ * @brief 报警发送状态处理
+ */
+static void handle_alarm_sending(void)
+{
+    // 检查报警发送状态
+    if (g_state_machine.alarm_send_status == 1) {
+        // 报警发送成功
+        transition_to_state(STATE_ALARM_COMPLETE);
+        g_state_machine.alarm_send_status = 0;  // 清除状态
+        return;
+    } else if (g_state_machine.alarm_send_status == 2) {
+        // 报警发送失败
+        printf("STATE_WARNING: Alarm sending failed\r\n");
+        g_state_machine.false_alarms++;
+        transition_to_state(STATE_ERROR_HANDLING);
+        g_state_machine.alarm_send_status = 0;  // 清除状态
+        return;
+    }
+
+    // 超时检查
+    uint32_t current_time = HAL_GetTick();
+    if (current_time - g_state_machine.state_enter_time > STATE_ALARM_SENDING_TIMEOUT_MS) {
+        printf("STATE_WARNING: Alarm sending timeout\r\n");
+        g_state_machine.false_alarms++;
+        transition_to_state(STATE_ERROR_HANDLING);
+    }
+}
+
+/**
+ * @brief 报警完成状态处理
+ */
+static void handle_alarm_complete(void)
+{
+    printf("STATE_INFO: Alarm cycle completed successfully\r\n");
+
+    // 报警完成，返回监测模式
+    transition_to_state(STATE_MONITORING);
+}
+
+/**
+ * @brief 错误处理状态处理
+ */
+static void handle_error_handling(void)
+{
+    printf("STATE_ERROR: Error code %d, recovering...\r\n", g_state_machine.error_code);
+
+    // 错误恢复延迟
+    uint32_t current_time = HAL_GetTick();
+    if (current_time - g_state_machine.state_enter_time > STATE_ERROR_RECOVERY_DELAY_MS) {
+        // 清除错误，返回监测模式
+        g_state_machine.error_code = 0;
+        transition_to_state(STATE_MONITORING);
+    }
+}
+
+/**
+ * @brief 系统重置状态处理
+ */
+static void handle_system_reset(void)
+{
+    printf("STATE_INFO: System reset requested\r\n");
+
+    // 重置状态机
+    memset(&g_state_machine, 0, sizeof(g_state_machine));
+    g_state_machine.current_state = STATE_SYSTEM_INIT;
+    g_state_machine.state_enter_time = HAL_GetTick();
+}
+
+/**
+ * @brief 初始化系统状态机
+ * @return 0: 成功, -1: 失败
+ */
+int System_State_Machine_Init(void)
+{
+    if (state_machine_initialized) {
+        return 0;  // 已经初始化
+    }
+
+    // 清零状态机结构体
+    memset(&g_state_machine, 0, sizeof(g_state_machine));
+
+    // 设置初始状态
+    g_state_machine.current_state = STATE_SYSTEM_INIT;
+    g_state_machine.previous_state = STATE_SYSTEM_INIT;
+    g_state_machine.state_enter_time = HAL_GetTick();
+
+    state_machine_initialized = 1;
+
+    printf("=== SYSTEM STATE MACHINE INITIALIZED ===\r\n");
+    return 0;
+}
+
+/**
+ * @brief 主状态机处理函数
+ */
+void System_State_Machine_Process(void)
+{
+    if (!state_machine_initialized) {
+        return;
+    }
+
+    // 更新状态持续时间
+    g_state_machine.state_duration = HAL_GetTick() - g_state_machine.state_enter_time;
+
+    // 根据当前状态调用相应处理函数
+    switch (g_state_machine.current_state) {
+        case STATE_SYSTEM_INIT:
+            handle_system_init();
+            break;
+
+        case STATE_IDLE_SLEEP:
+            handle_idle_sleep();
+            break;
+
+        case STATE_MONITORING:
+            handle_monitoring();
+            break;
+
+        case STATE_COARSE_TRIGGERED:
+            handle_coarse_triggered();
+            break;
+
+        case STATE_FINE_ANALYSIS:
+            handle_fine_analysis();
+            break;
+
+        case STATE_MINING_DETECTED:
+            handle_mining_detected();
+            break;
+
+        case STATE_ALARM_SENDING:
+            handle_alarm_sending();
+            break;
+
+        case STATE_ALARM_COMPLETE:
+            handle_alarm_complete();
+            break;
+
+        case STATE_ERROR_HANDLING:
+            handle_error_handling();
+            break;
+
+        case STATE_SYSTEM_RESET:
+            handle_system_reset();
+            break;
+
+        default:
+            printf("STATE_ERROR: Unknown state %d\r\n", g_state_machine.current_state);
+            g_state_machine.error_code = 1;
+            transition_to_state(STATE_ERROR_HANDLING);
+            break;
+    }
+}
+
+/**
+ * @brief 设置粗检测触发标志
+ * @param triggered: 1=触发, 0=未触发
+ */
+void System_State_Machine_SetCoarseTrigger(uint8_t triggered)
+{
+    if (triggered) {
+        g_state_machine.coarse_trigger_flag = 1;
+        printf("STATE_EVENT: Coarse detection triggered\r\n");
+    }
+}
+
+/**
+ * @brief 设置细检测结果
+ * @param result: 0=无效, 1=正常, 2=挖掘
+ */
+void System_State_Machine_SetFineResult(uint8_t result)
+{
+    g_state_machine.fine_analysis_result = result;
+    if (result == 2) {
+        printf("STATE_EVENT: Mining vibration detected by fine analysis\r\n");
+    } else if (result == 1) {
+        printf("STATE_EVENT: Normal vibration detected by fine analysis\r\n");
+    }
+}
+
+/**
+ * @brief 设置报警发送状态
+ * @param status: 0=进行中, 1=成功, 2=失败
+ */
+void System_State_Machine_SetAlarmStatus(uint8_t status)
+{
+    g_state_machine.alarm_send_status = status;
+    if (status == 1) {
+        printf("STATE_EVENT: Alarm sent successfully\r\n");
+    } else if (status == 2) {
+        printf("STATE_EVENT: Alarm sending failed\r\n");
+    }
+}
+
+/**
+ * @brief 设置错误代码
+ * @param error_code: 错误代码
+ */
+void System_State_Machine_SetError(uint8_t error_code)
+{
+    g_state_machine.error_code = error_code;
+    printf("STATE_EVENT: Error occurred, code=%d\r\n", error_code);
+}
+
+/**
+ * @brief 获取当前状态
+ * @return 当前状态
+ */
+system_state_t System_State_Machine_GetCurrentState(void)
+{
+    return g_state_machine.current_state;
+}
+
+/**
+ * @brief 打印状态机状态信息
+ */
+void System_State_Machine_PrintStatus(void)
+{
+    if (!state_machine_initialized) {
+        printf("STATE_INFO: State machine not initialized\r\n");
+        return;
+    }
+
+    printf("=== SYSTEM STATE MACHINE STATUS ===\r\n");
+    printf("Current State: %s (duration: %lums)\r\n",
+           state_names[g_state_machine.current_state],
+           g_state_machine.state_duration);
+    printf("Previous State: %s\r\n", state_names[g_state_machine.previous_state]);
+    printf("Total Transitions: %lu\r\n", g_state_machine.transition_count);
+    printf("Total Detections: %lu\r\n", g_state_machine.total_detections);
+    printf("Mining Detections: %lu\r\n", g_state_machine.mining_detections);
+    printf("False Alarms: %lu\r\n", g_state_machine.false_alarms);
+
+    // 状态计数统计
+    printf("State Counts:\r\n");
+    for (int i = 0; i < STATE_COUNT; i++) {
+        if (g_state_machine.state_count[i] > 0) {
+            printf("  %s: %lu\r\n", state_names[i], g_state_machine.state_count[i]);
+        }
+    }
+    printf("=====================================\r\n");
+}
+
 #endif
 
