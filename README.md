@@ -67,13 +67,10 @@ IIM-42352-STM32F4/
 ├── sys/                              # 系统配置
 ├── MDK-ARM/                          # Keil工程文件
 ├── vibration_analyzer_chinese.py     # 中文版上位机 (推荐) - 集成STM32报警触发功能
-├── vibration_analyzer_pro_en.py      # 英文版上位机
-├── test_raw_data.py                  # 原始数据测试工具
+├── vibration_analyzer_pro_en.py      # 英文版上位机 (备选方案)
 ├── binary_command_test.py            # LoRa通信测试工具 (🆕 v3.2新增)
 ├── test_mining_detection_alarm.py    # 挖掘检测报警功能测试工具 (🆕 v3.3新增)
 ├── verify_alarm_integration.py       # 报警集成功能验证工具 (🆕 v3.3新增)
-├── run_analyzer.bat                  # 一键启动脚本
-├── UPGRADE_NOTES.md                  # 升级说明文档
 ├── MINING_DETECTION_ALARM_GUIDE.md   # 挖掘检测报警功能详细说明 (🆕 v3.3新增)
 ├── FINAL_IMPLEMENTATION_SUMMARY.md   # 最终实现总结文档 (🆕 v3.3新增)
 └── README.md                         # 本文档
@@ -451,9 +448,7 @@ pip install matplotlib numpy pyserial tkinter
 # 运行上位机
 python vibration_analyzer_chinese.py  # 中文版 (推荐)
 # 或
-python vibration_analyzer_pro_en.py   # 英文版
-# 或使用一键启动
-run_analyzer.bat                       # Windows一键启动
+python vibration_analyzer_pro_en.py   # 英文版 (备选方案)
 
 # LoRa通信系统测试 (🆕 v3.2新增)
 python binary_command_test.py         # LoRa通信功能测试
@@ -482,8 +477,8 @@ python verify_alarm_integration.py    # 报警集成功能验证
 
 ### **1. 功能验证测试**
 ```bash
-# 运行原始数据测试
-python test_raw_data.py
+# 运行挖掘检测报警功能测试
+python test_mining_detection_alarm.py
 
 # 检查项目:
 - 协议解析功能 ✅ (频域+原始数据)
@@ -492,6 +487,8 @@ python test_raw_data.py
 - 数据缩放处理 ✅
 - 原始数据显示 ✅
 - GUI组件功能 ✅
+- 挖掘检测算法 ✅
+- STM32报警触发 ✅
 
 # LoRa通信系统测试 (🆕 v3.2新增)
 python binary_command_test.py
@@ -576,10 +573,10 @@ python binary_command_test.py
 
 ### **调试工具**
 ```bash
-python test_raw_data.py           # 原始数据接收测试
 python binary_command_test.py     # LoRa通信系统测试 (🆕 v3.2新增)
-python vibration_analyzer_pro_en.py  # 英文版（无字体问题）
-run_analyzer.bat                  # 一键启动脚本
+python test_mining_detection_alarm.py # 挖掘检测报警功能测试 (🆕 v3.3新增)
+python verify_alarm_integration.py    # 报警集成功能验证 (🆕 v3.3新增)
+python vibration_analyzer_pro_en.py   # 英文版上位机（备选方案）
 ```
 
 ## 📈 **项目成果**
