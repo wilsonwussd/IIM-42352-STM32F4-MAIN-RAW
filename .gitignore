@@ -118,6 +118,14 @@ Thumbs.db
 # Log files
 *.log
 
+# Build output files (v4.0 development)
+MDK-ARM/build_output*.txt
+
+# Development scripts (v4.0)
+fix_filter_coeffs.py
+generate_correct_coeffs.py
+verify_filter_coeffs.py
+
 # Temporary files
 *.tmp
 *.temp
