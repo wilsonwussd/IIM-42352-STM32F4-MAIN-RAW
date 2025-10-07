@@ -261,6 +261,7 @@ int main(void)
   printf("Version: v4.0-dev (Stage 1 Verification)\n");
   printf("Bolgen Studio\n");
 
+
 #if ENABLE_INTELLIGENT_DETECTION
   printf("INTELLIGENT DETECTION: ENABLED\n");
 #if ENABLE_DATA_PREPROCESSING
@@ -586,9 +587,11 @@ static void MX_GPIO_Init(void)
   __HAL_RCC_GPIOH_CLK_ENABLE();
   __HAL_RCC_GPIOA_CLK_ENABLE();
   __HAL_RCC_GPIOC_CLK_ENABLE();
+  __HAL_RCC_GPIOE_CLK_ENABLE();  /* Enable GPIOE clock for PE14 */
 
   /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(CSB_GPIO_Port, CSB_Pin, GPIO_PIN_SET);
+  HAL_GPIO_WritePin(GPIOE, GPIO_PIN_14, GPIO_PIN_SET);  /* Set PE14 to HIGH */
 
   /*Configure GPIO pin : CSB_Pin */
   GPIO_InitStruct.Pin = CSB_Pin;
@@ -603,6 +606,13 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Pull = GPIO_PULLDOWN;
   HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
 
+  /*Configure GPIO pin : PE14 */
+  GPIO_InitStruct.Pin = GPIO_PIN_14;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;  /* Push-pull output */
+  GPIO_InitStruct.Pull = GPIO_PULLDOWN;        /* Pull-down resistor */
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW; /* Low speed */
+  HAL_GPIO_Init(GPIOE, &GPIO_InitStruct);
+
   /* EXTI interrupt init*/
   HAL_NVIC_SetPriority(EXTI9_5_IRQn, 0, 0);
   HAL_NVIC_EnableIRQ(EXTI9_5_IRQn);
@@ -610,6 +620,20 @@ static void MX_GPIO_Init(void)
 }
 
 /* USER CODE BEGIN 4 */
+
+/**
+ * @brief Test PE14 GPIO pin functionality
+ * @param None
+ * @retval None
+ */
+void Test_PE14_GPIO(void)
+{
+
+
+    // Final state (HIGH)
+    HAL_GPIO_WritePin(GPIOE, GPIO_PIN_14, GPIO_PIN_SET);
+
+}
 
 /*
  * This function initializes MCU on which this software is running.

@@ -59,6 +59,9 @@ void Error_Handler(void);
 /* USER CODE BEGIN EFP */
 #define CSB_Pin GPIO_PIN_4
 #define CSB_GPIO_Port GPIOA
+
+/* PE14 GPIO Test Function */
+void Test_PE14_GPIO(void);
 /* USER CODE END EFP */
 
 /* Private defines -----------------------------------------------------------*/
