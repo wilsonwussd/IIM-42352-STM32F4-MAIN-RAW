@@ -113,22 +113,18 @@ uint8_t uart1_rx_buffer[64];
 volatile uint8_t uart1_rx_complete = 0;
 uint8_t uart1_rx_index = 0;
 
-/* Alarm Signal State */
+/* Alarm Signal State - 简化版本，无HOLD状态 */
 typedef enum {
     ALARM_STATE_IDLE = 0,
     ALARM_STATE_SET_1,
     ALARM_STATE_WAIT_RESPONSE_1,
-    ALARM_STATE_HOLD,
-    ALARM_STATE_SET_0,
     ALARM_STATE_WAIT_RESPONSE_0,
     ALARM_STATE_COMPLETE
 } alarm_state_t;
 
 volatile alarm_state_t alarm_state = ALARM_STATE_IDLE;
-uint32_t alarm_hold_start_time = 0;
 uint32_t lora_timeout_start_time = 0;
 
-#define ALARM_HOLD_TIME_MS      1000    // 1 second hold time
 #define LORA_TIMEOUT_MS         5000    // 5 second timeout for LoRa response
 /* USER CODE END PV */
 
@@ -283,6 +279,7 @@ int main(void)
   Start_LoRa_Reception();
 
   printf("LoRa Communication System Initialized\n");
+  printf("PE14 LoRa Power Control: OFF (Low Power Mode)\n");
   printf("Waiting for commands from upper computer...\n");
 
 		/* Initialize MCU hardware */
@@ -1160,9 +1157,11 @@ void Process_Alarm_State_Machine(void)
                 lora_rx_index = 0;
                 Start_LoRa_Reception();
 
-                // 进入保持状态
-                alarm_hold_start_time = HAL_GetTick();
-                alarm_state = ALARM_STATE_HOLD;
+                // 立即发送设置0命令 (无延时)
+                printf("Immediately setting alarm register to 0...\n");
+                Build_Modbus_Command(0, modbus_command);
+                LoRa_Send_Command(modbus_command, 11);
+                alarm_state = ALARM_STATE_WAIT_RESPONSE_0;
                 Send_Response_To_PC("ALARM_SET_SUCCESS");
 
                 // 通知系统状态机报警发送进行中
@@ -1171,8 +1170,11 @@ void Process_Alarm_State_Machine(void)
                 #endif
             } else if ((HAL_GetTick() - lora_timeout_start_time) > LORA_TIMEOUT_MS) {
                 printf("Timeout waiting for response to set 1\n");
+                // 超时时断电LoRa模块 (PE14 = LOW)
+                HAL_GPIO_WritePin(GPIOE, GPIO_PIN_14, GPIO_PIN_RESET);
                 alarm_state = ALARM_STATE_IDLE;
                 Send_Response_To_PC("ALARM_SET_TIMEOUT");
+                printf("LoRa powered OFF due to timeout (PE14=LOW)\n");
 
                 // 通知系统状态机报警发送失败
                 #if ENABLE_SYSTEM_STATE_MACHINE
@@ -1181,14 +1183,7 @@ void Process_Alarm_State_Machine(void)
             }
             break;
 
-        case ALARM_STATE_HOLD:
-            if ((HAL_GetTick() - alarm_hold_start_time) >= ALARM_HOLD_TIME_MS) {
-                printf("Hold time completed, setting alarm register to 0...\n");
-                Build_Modbus_Command(0, modbus_command);
-                LoRa_Send_Command(modbus_command, 11);
-                alarm_state = ALARM_STATE_WAIT_RESPONSE_0;
-            }
-            break;
+        // ALARM_STATE_HOLD 已删除 - 无需延时，直接从 WAIT_RESPONSE_1 转到 WAIT_RESPONSE_0
 
         case ALARM_STATE_WAIT_RESPONSE_0:
             // 检查是否收到LoRa响应
@@ -1208,9 +1203,11 @@ void Process_Alarm_State_Machine(void)
                 lora_rx_index = 0;
                 Start_LoRa_Reception();
 
-                // 进入完成状态
+                // 断电LoRa模块 (PE14 = LOW)
+                HAL_GPIO_WritePin(GPIOE, GPIO_PIN_14, GPIO_PIN_RESET);
                 alarm_state = ALARM_STATE_COMPLETE;
                 Send_Response_To_PC("ALARM_RESET_SUCCESS");
+                printf("LoRa powered OFF (PE14=LOW)\n");
 
                 // 通知系统状态机报警发送成功
                 #if ENABLE_SYSTEM_STATE_MACHINE
@@ -1218,8 +1215,11 @@ void Process_Alarm_State_Machine(void)
                 #endif
             } else if ((HAL_GetTick() - lora_timeout_start_time) > LORA_TIMEOUT_MS) {
                 printf("Timeout waiting for response to set 0\n");
+                // 超时时也要断电LoRa模块 (PE14 = LOW)
+                HAL_GPIO_WritePin(GPIOE, GPIO_PIN_14, GPIO_PIN_RESET);
                 alarm_state = ALARM_STATE_IDLE;
                 Send_Response_To_PC("ALARM_RESET_TIMEOUT");
+                printf("LoRa powered OFF due to timeout (PE14=LOW)\n");
 
                 // 通知系统状态机报警发送失败
                 #if ENABLE_SYSTEM_STATE_MACHINE
@@ -1245,8 +1245,11 @@ void Process_Alarm_State_Machine(void)
 void Trigger_Alarm_Cycle(void)
 {
     if (alarm_state == ALARM_STATE_IDLE) {
+        // 上电LoRa模块 (PE14 = HIGH)
+        HAL_GPIO_WritePin(GPIOE, GPIO_PIN_14, GPIO_PIN_SET);
+			HAL_Delay(500);  // 等待LoRa模块启动
         alarm_state = ALARM_STATE_SET_1;
-        printf("Alarm cycle triggered\n");
+        printf("Alarm cycle triggered, LoRa powered ON (PE14=HIGH)\n");
     } else {
         printf("Alarm cycle already in progress\n");
     }
