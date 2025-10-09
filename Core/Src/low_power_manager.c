@@ -118,19 +118,25 @@ int LowPower_EnterSleep(void)
 
     // 恢复SysTick中断
     HAL_ResumeTick();
-    
+
     // 唤醒后执行
     g_low_power_manager.is_sleeping = false;
     uint32_t sleep_end_time = HAL_GetTick();
     uint32_t sleep_duration = sleep_end_time - sleep_start_time;
+
+    // 注意：由于HAL_SuspendTick()，sleep_duration只包含进入/退出Sleep的开销
+    // 实际Sleep时间由RTC周期决定（例如2秒），但HAL_GetTick()在Sleep期间不更新
+    // 所以这里的sleep_duration不代表真实的Sleep时间
     g_low_power_manager.total_sleep_time_sec += sleep_duration / 1000;
-    
+
     if (g_low_power_manager.debug_enabled) {
         // 检查唤醒原因
         if (RTC_Wakeup_IsPending()) {
-            printf("LOW_POWER: Woke up from RTC interrupt (duration: %lu ms)\r\n", sleep_duration);
+            printf("LOW_POWER: Woke up from RTC interrupt\r\n");
+            printf("LOW_POWER: Note: Actual sleep time is ~%lu sec (RTC period), HAL_GetTick() overhead: %lu ms\r\n",
+                   g_low_power_manager.wakeup_period_sec, sleep_duration);
         } else {
-            printf("LOW_POWER: Woke up from OTHER interrupt (duration: %lu ms)\r\n", sleep_duration);
+            printf("LOW_POWER: Woke up from OTHER interrupt (overhead: %lu ms)\r\n", sleep_duration);
         }
     }
     
@@ -231,8 +237,11 @@ bool LowPower_IsDetectionComplete(void)
 #if ENABLE_SYSTEM_STATE_MACHINE
     // 获取系统状态机状态
     system_state_t current_state = System_State_Machine_GetCurrentState();
+    // 只有在MONITORING或IDLE_SLEEP状态时才认为检测完成
+    // 如果在MINING_DETECTED、ALARM_SENDING等状态，需要继续处理
     bool state_machine_idle = (current_state == STATE_MONITORING ||
-                              current_state == STATE_IDLE_SLEEP);
+                              current_state == STATE_IDLE_SLEEP ||
+                              current_state == STATE_ALARM_COMPLETE);
 #else
     bool state_machine_idle = true;  // 如果状态机未启用，认为空闲
 #endif

@@ -42,8 +42,11 @@ int RTC_Wakeup_Init(void)
     // 初始化RTC
     hrtc.Instance = RTC;
     hrtc.Init.HourFormat = RTC_HOURFORMAT_24;
-    hrtc.Init.AsynchPrediv = 124;    // LSI (32kHz) / (124+1) = 256Hz
-    hrtc.Init.SynchPrediv = 255;     // 256Hz / (255+1) = 1Hz
+    // LSI频率通常在17-47kHz范围内，标称32kHz
+    // 使用标准的预分频器配置：AsynchPrediv=127, SynchPrediv=255
+    // 这样可以更好地适应LSI频率变化
+    hrtc.Init.AsynchPrediv = 127;    // LSI / (127+1) = LSI/128
+    hrtc.Init.SynchPrediv = 255;     // (LSI/128) / (255+1) = LSI/32768 ≈ 1Hz (当LSI=32768Hz时)
     hrtc.Init.OutPut = RTC_OUTPUT_DISABLE;
     hrtc.Init.OutPutPolarity = RTC_OUTPUT_POLARITY_HIGH;
     hrtc.Init.OutPutType = RTC_OUTPUT_TYPE_OPENDRAIN;
@@ -183,17 +186,19 @@ int RTC_Wakeup_HandleInterrupt(void)
     rtc_wakeup_flag = true;
     g_rtc_stats.is_wakeup_pending = true;
 
-    // 调试信息：显示唤醒间隔
-    static uint32_t last_wakeup_tick = 0;
-    uint32_t current_tick = HAL_GetTick();
-    if (last_wakeup_tick > 0) {
-        uint32_t interval_ms = current_tick - last_wakeup_tick;
-        printf("RTC_WAKEUP: *** RTC INTERRUPT *** Interval = %lu ms (expected: %lu ms)\r\n",
-               interval_ms, g_rtc_stats.wakeup_period_sec * 1000);
-    } else {
+    // 调试信息：使用RTC计数器而不是HAL_GetTick()
+    // 因为HAL_GetTick()在Sleep期间被暂停，不能准确反映RTC间隔
+    static uint32_t wakeup_count = 0;
+    wakeup_count++;
+
+    if (wakeup_count == 1) {
         printf("RTC_WAKEUP: *** FIRST RTC INTERRUPT ***\r\n");
+        printf("RTC_WAKEUP: RTC timer is running with %lu sec period\r\n", g_rtc_stats.wakeup_period_sec);
+    } else {
+        // RTC硬件定时器工作正常，每次中断间隔固定为配置的周期
+        printf("RTC_WAKEUP: *** RTC INTERRUPT #%lu *** (period: %lu sec)\r\n",
+               wakeup_count, g_rtc_stats.wakeup_period_sec);
     }
-    last_wakeup_tick = current_tick;
 
     return 0;
 }
@@ -287,31 +292,23 @@ static int RTC_Wakeup_ConfigureClock(void)
  */
 static int RTC_Wakeup_ConfigureTimer(uint32_t period_sec)
 {
-    // 基于实际测试调整计数值
-    // 当前实际间隔约500ms，目标2000ms，需要4倍计数值
-    // 实验性调整：使用更大的计数值来获得更长的间隔
-    uint32_t wakeup_counter;
+    // 使用RTC_WAKEUPCLOCK_CK_SPRE_16BITS时钟源（1Hz）
+    // 计数器值直接等于期望的秒数
+    uint32_t wakeup_counter = period_sec;
 
-    if (period_sec == 2) {
-        // 基于实际测试精确调整
-        // 计数值32产生5828ms间隔，目标2000ms
-        // 新计数值 = 32 × (2000/5828) ≈ 11
-        wakeup_counter = 11;  // 期望获得约2秒间隔
-    } else {
-        wakeup_counter = period_sec * 5;  // 其他周期使用调整后的系数
-    }
-
-    // 检查计数值范围
+    // 检查计数值范围（16位计数器，最大65535秒）
     if (wakeup_counter > 0xFFFF) {
-        printf("RTC_WAKEUP: ERROR - Wakeup period too long (max ~32 seconds)\r\n");
+        printf("RTC_WAKEUP: ERROR - Wakeup period too long (max 65535 seconds)\r\n");
         return -1;
     }
 
+    printf("RTC_WAKEUP: === TIMER CONFIGURATION ===\r\n");
     printf("RTC_WAKEUP: Wakeup counter value: %lu (period: %lu sec)\r\n", wakeup_counter, period_sec);
     printf("RTC_WAKEUP: Clock source: 0x%X, Clock freq: %lu Hz\r\n", RTC_WAKEUP_CLOCK_SOURCE, RTC_WAKEUP_CLOCK_FREQ);
     printf("RTC_WAKEUP: Expected interval: %lu ms\r\n", period_sec * 1000);
+    printf("RTC_WAKEUP: AsynchPrediv: %lu, SynchPrediv: %lu\r\n", (uint32_t)hrtc.Init.AsynchPrediv, (uint32_t)hrtc.Init.SynchPrediv);
 
-    // 实际配置HAL库的RTC唤醒定时器
+    // 配置HAL库的RTC唤醒定时器
     HAL_StatusTypeDef hal_status = HAL_RTCEx_SetWakeUpTimer_IT(&hrtc, wakeup_counter, RTC_WAKEUP_CLOCK_SOURCE);
     if (hal_status != HAL_OK) {
         printf("RTC_WAKEUP: ERROR - Failed to set wakeup timer, HAL status: %d\r\n", hal_status);

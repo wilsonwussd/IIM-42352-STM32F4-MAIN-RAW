@@ -419,6 +419,11 @@
               <FileType>1</FileType>
               <FilePath>..\Core\Src\low_power_manager.c</FilePath>
             </File>
+            <File>
+              <FileName>rtc_wakeup.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\Core\Src\rtc_wakeup.c</FilePath>
+            </File>
           </Files>
         </Group>
         <Group>

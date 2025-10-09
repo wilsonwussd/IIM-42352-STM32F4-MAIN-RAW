@@ -896,14 +896,17 @@ static void handle_fine_analysis(void)
 {
     // 检查细检测结果
     if (g_state_machine.fine_analysis_result != 0) {
+        printf("STATE_DEBUG: Fine analysis result = %d\r\n", g_state_machine.fine_analysis_result);
         if (g_state_machine.fine_analysis_result == 2) {
             // 检测到挖掘震动
             g_state_machine.total_detections++;
             g_state_machine.mining_detections++;
+            printf("STATE_INFO: Transitioning to MINING_DETECTED state\r\n");
             transition_to_state(STATE_MINING_DETECTED);
         } else {
             // 正常震动，返回监测模式
             g_state_machine.total_detections++;
+            printf("STATE_INFO: Normal vibration, returning to MONITORING\r\n");
             transition_to_state(STATE_MONITORING);
         }
         g_state_machine.fine_analysis_result = 0;  // 清除结果
@@ -1105,6 +1108,8 @@ void System_State_Machine_SetCoarseTrigger(uint8_t triggered)
  */
 void System_State_Machine_SetFineResult(uint8_t result)
 {
+    printf("STATE_DEBUG: SetFineResult called with result=%d, current_state=%s\r\n",
+           result, state_names[g_state_machine.current_state]);
     g_state_machine.fine_analysis_result = result;
     if (result == 2) {
         printf("STATE_EVENT: Mining vibration detected by fine analysis\r\n");
