@@ -397,6 +397,18 @@ int main(void)
 
 			/* 运行现有的检测流程直到完成 */
 			do {
+				/* 场景1优化：检查是否应该快速退出 */
+				if (LowPower_ShouldFastExit()) {
+					/* 粗检测未触发，快速退出，不再处理传感器FIFO */
+					/* 清空待处理的传感器中断标志 */
+					irq_from_device &= ~TO_MASK(INV_GPIO_INT1);
+
+					/* 在退出前打印检测完成统计（触发统计输出） */
+					LowPower_IsDetectionComplete();
+
+					break;  /* 立即退出循环 */
+				}
+
 				/* Poll device for data */
 				if (irq_from_device & TO_MASK(INV_GPIO_INT1)) {
 					rc = GetDataFromInvDevice();

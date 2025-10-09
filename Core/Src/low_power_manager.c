@@ -206,6 +206,9 @@ int LowPower_StartDetectionProcess(void)
     // 传感器启动延时
     HAL_Delay(SENSOR_STARTUP_DELAY_MS);
 
+    // 重置快速退出标志
+    g_low_power_manager.fast_exit_enabled = 0;
+
 #if ENABLE_COARSE_DETECTION
     // 重置粗检测窗口，确保每次唤醒都重新收集2000个样本
     // 这样可以确保每次检测都基于最新的2秒数据
@@ -237,71 +240,125 @@ bool LowPower_IsDetectionComplete(void)
         return true;  // 如果未初始化，认为检测完成
     }
 
-    // 检测完成的判断逻辑：
+    // 优化的检测完成判断逻辑：
     // 1. 粗检测RMS窗口必须已满（确保收集了足够的样本）
-    // 2. 如果没有传感器中断待处理
-    // 3. 并且系统状态机处于稳定状态
-    // 4. 并且没有LoRa报警正在进行
+    // 2. 如果粗检测未触发 -> 立即完成（场景1：快速完成）
+    // 3. 如果粗检测触发 -> 等待状态机完成（场景2/3）
 
 #if ENABLE_COARSE_DETECTION
     // 首先检查粗检测窗口是否已满
     // 这确保至少收集了2000个样本（2秒@1000Hz）
     extern bool Coarse_Detector_IsWindowFull(void);
+    extern coarse_detection_state_t Coarse_Detector_GetState(void);
+
     bool window_full = Coarse_Detector_IsWindowFull();
     if (!window_full) {
         // 窗口未满，继续收集数据
         return false;
     }
-#endif
 
-    bool sensor_idle = (irq_from_device == 0);
+    // 窗口已满，检查粗检测状态
+    coarse_detection_state_t coarse_state = Coarse_Detector_GetState();
+    if (coarse_state == COARSE_STATE_IDLE) {
+        // 粗检测未触发，立即完成（场景1：无振动）
+        // 设置快速退出标志，通知主循环停止处理传感器数据
+        g_low_power_manager.fast_exit_enabled = 1;
+        bool detection_complete = true;
+        goto detection_done;  // 跳转到统计部分
+    }
+
+    // 粗检测已触发，需要等待完整的检测流程完成
+    g_low_power_manager.fast_exit_enabled = 0;
+#endif
 
 #if ENABLE_SYSTEM_STATE_MACHINE
     // 获取系统状态机状态
     system_state_t current_state = System_State_Machine_GetCurrentState();
-    // 只有在MONITORING或IDLE_SLEEP状态时才认为检测完成
-    // 如果在MINING_DETECTED、ALARM_SENDING等状态，需要继续处理
+    // 只有在MONITORING或ALARM_COMPLETE状态时才认为检测完成
+    // 如果在COARSE_TRIGGERED、FINE_ANALYSIS、MINING_DETECTED、ALARM_SENDING等状态，需要继续处理
     bool state_machine_idle = (current_state == STATE_MONITORING ||
                               current_state == STATE_IDLE_SLEEP ||
                               current_state == STATE_ALARM_COMPLETE);
+
+    bool detection_complete = state_machine_idle;
 #else
-    bool state_machine_idle = true;  // 如果状态机未启用，认为空闲
+    // 如果状态机未启用，窗口满且粗检测未触发就完成
+    bool detection_complete = true;
 #endif
 
-    // 检查是否有报警正在进行
-    bool alarm_idle = true;  // 这里可以添加报警状态检查
-
-    bool detection_complete = sensor_idle && state_machine_idle && alarm_idle;
+detection_done:
     
     if (detection_complete && g_low_power_manager.detection_start_time > 0) {
         // 更新检测结束时间和统计
         g_low_power_manager.detection_end_time = HAL_GetTick();
         uint32_t detection_duration = g_low_power_manager.detection_end_time - g_low_power_manager.detection_start_time;
         g_low_power_manager.total_active_time_ms += detection_duration;
-        
+
         if (g_low_power_manager.debug_enabled) {
             printf("LOW_POWER: Detection completed (duration: %lu ms)\r\n", detection_duration);
             printf("LOW_POWER: === SCENARIO ANALYSIS END ===\r\n");
 
-            // 分析检测场景（更新为2000样本窗口）
-            if (detection_duration < 2200) {
+            // 优化的场景判断：基于实际检测状态而不是时间
+#if ENABLE_COARSE_DETECTION && ENABLE_SYSTEM_STATE_MACHINE
+            extern coarse_detection_state_t Coarse_Detector_GetState(void);
+            coarse_detection_state_t coarse_state = Coarse_Detector_GetState();
+            system_state_t current_state = System_State_Machine_GetCurrentState();
+
+            if (coarse_state == COARSE_STATE_IDLE) {
+                // 粗检测未触发 -> 场景1
                 printf("LOW_POWER: >>> SCENARIO 1: No vibration detected (quick completion)\r\n");
-                printf("LOW_POWER: >>> Expected: 2000 samples (2s) -> Coarse detection [NOT TRIGGERED] -> Sleep\r\n");
-            } else if (detection_duration < 4000) {
+                printf("LOW_POWER: >>> Expected: 2000 samples (2s) -> Coarse [NOT TRIGGERED] -> Sleep\r\n");
+                printf("LOW_POWER: >>> Actual: Window full, no trigger, fast completion\r\n");
+            } else if (current_state == STATE_MONITORING &&
+                      (coarse_state == COARSE_STATE_TRIGGERED || coarse_state == COARSE_STATE_COOLDOWN)) {
+                // 粗检测触发但未进入报警 -> 场景2
                 printf("LOW_POWER: >>> SCENARIO 2: Normal vibration detected (moderate duration)\r\n");
-                printf("LOW_POWER: >>> Expected: 2000 samples -> Coarse [TRIGGERED] -> 512 samples -> FFT -> Fine [NORMAL] -> Sleep\r\n");
-            } else {
+                printf("LOW_POWER: >>> Expected: 2000 samples -> Coarse [TRIGGERED] -> FFT -> Fine [NORMAL] -> Sleep\r\n");
+                printf("LOW_POWER: >>> Actual: Coarse triggered, fine analysis completed, no alarm\r\n");
+            } else if (current_state == STATE_ALARM_COMPLETE) {
+                // 完成报警流程 -> 场景3
                 printf("LOW_POWER: >>> SCENARIO 3: Mining vibration detected with alarm\r\n");
                 printf("LOW_POWER: >>> Expected: Full detection chain + LoRa alarm (~5-7 seconds)\r\n");
+                printf("LOW_POWER: >>> Actual: Mining detected, alarm sent successfully\r\n");
+            } else {
+                // 其他情况（例如错误恢复）
+                printf("LOW_POWER: >>> SCENARIO: Other (state=%d, coarse_state=%d)\r\n", current_state, coarse_state);
             }
+#else
+            // 如果没有启用检测算法，使用时间判断（兼容模式）
+            if (detection_duration < 2200) {
+                printf("LOW_POWER: >>> SCENARIO 1: Quick completion (duration < 2.2s)\r\n");
+            } else if (detection_duration < 4000) {
+                printf("LOW_POWER: >>> SCENARIO 2: Moderate duration (2.2s - 4s)\r\n");
+            } else {
+                printf("LOW_POWER: >>> SCENARIO 3: Long duration (> 4s)\r\n");
+            }
+#endif
             printf("LOW_POWER: >>> Power saving achieved: Sleep mode between detections\r\n");
         }
-        
+
         // 重置检测开始时间
         g_low_power_manager.detection_start_time = 0;
     }
     
     return detection_complete;
+}
+
+/**
+ * @brief 检查是否应该快速退出（场景1优化）
+ *
+ * 当粗检测未触发时，不需要继续处理传感器FIFO中的剩余数据
+ * 可以立即退出主循环，节省时间
+ *
+ * @return true: 应该快速退出, false: 继续正常处理
+ */
+bool LowPower_ShouldFastExit(void)
+{
+    if (!g_low_power_initialized) {
+        return false;
+    }
+
+    return g_low_power_manager.fast_exit_enabled;
 }
 
 /**

@@ -86,6 +86,7 @@ typedef struct {
     uint32_t next_sleep_time;           // 下次Sleep时间
     uint32_t detection_start_time;      // 检测开始时间
     uint32_t detection_end_time;        // 检测结束时间
+    uint8_t fast_exit_enabled;          // 快速退出标志（场景1优化）
 } low_power_manager_t;
 
 /* 核心API接口声明 */
@@ -119,6 +120,12 @@ int LowPower_StartDetectionProcess(void);
  * @return true: 检测完成, false: 检测进行中
  */
 bool LowPower_IsDetectionComplete(void);
+
+/**
+ * @brief 检查是否应该快速退出（场景1优化）
+ * @return true: 应该快速退出, false: 继续正常处理
+ */
+bool LowPower_ShouldFastExit(void);
 
 /**
  * @brief 功耗统计更新
