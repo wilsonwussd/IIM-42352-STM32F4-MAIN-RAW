@@ -193,7 +193,7 @@ int LowPower_StartDetectionProcess(void)
     if (g_low_power_manager.debug_enabled) {
         printf("LOW_POWER: Starting detection process (count: %lu)\r\n", g_low_power_manager.detection_count);
         printf("LOW_POWER: === SCENARIO ANALYSIS START ===\r\n");
-        printf("LOW_POWER: Will collect 200 samples for coarse detection\r\n");
+        printf("LOW_POWER: Will collect 2000 samples (2 seconds) for coarse detection\r\n");
         printf("LOW_POWER: Sensor startup delay: %d ms\r\n", SENSOR_STARTUP_DELAY_MS);
 
 #if ENABLE_SYSTEM_STATE_MACHINE
@@ -205,7 +205,17 @@ int LowPower_StartDetectionProcess(void)
     
     // 传感器启动延时
     HAL_Delay(SENSOR_STARTUP_DELAY_MS);
-    
+
+#if ENABLE_COARSE_DETECTION
+    // 重置粗检测窗口，确保每次唤醒都重新收集2000个样本
+    // 这样可以确保每次检测都基于最新的2秒数据
+    extern void Coarse_Detector_Reset(void);
+    Coarse_Detector_Reset();
+    if (g_low_power_manager.debug_enabled) {
+        printf("LOW_POWER: Coarse detector window reset for fresh data collection\r\n");
+    }
+#endif
+
     // 注意：这里不直接调用现有的检测函数，而是让主循环继续运行现有的检测逻辑
     // 现有的检测流程会在主循环中自动执行：
     // 1. 传感器中断触发数据采集
@@ -214,7 +224,7 @@ int LowPower_StartDetectionProcess(void)
     // 4. 智能FFT触发控制
     // 5. 细检测算法（5维特征提取）
     // 6. LoRa报警（如果检测到挖掘振动）
-    
+
     return 0;
 }
 
@@ -226,14 +236,26 @@ bool LowPower_IsDetectionComplete(void)
     if (!g_low_power_initialized) {
         return true;  // 如果未初始化，认为检测完成
     }
-    
+
     // 检测完成的判断逻辑：
-    // 1. 如果没有传感器中断待处理
-    // 2. 并且系统状态机处于稳定状态
-    // 3. 并且没有LoRa报警正在进行
-    
+    // 1. 粗检测RMS窗口必须已满（确保收集了足够的样本）
+    // 2. 如果没有传感器中断待处理
+    // 3. 并且系统状态机处于稳定状态
+    // 4. 并且没有LoRa报警正在进行
+
+#if ENABLE_COARSE_DETECTION
+    // 首先检查粗检测窗口是否已满
+    // 这确保至少收集了2000个样本（2秒@1000Hz）
+    extern bool Coarse_Detector_IsWindowFull(void);
+    bool window_full = Coarse_Detector_IsWindowFull();
+    if (!window_full) {
+        // 窗口未满，继续收集数据
+        return false;
+    }
+#endif
+
     bool sensor_idle = (irq_from_device == 0);
-    
+
 #if ENABLE_SYSTEM_STATE_MACHINE
     // 获取系统状态机状态
     system_state_t current_state = System_State_Machine_GetCurrentState();
@@ -245,10 +267,10 @@ bool LowPower_IsDetectionComplete(void)
 #else
     bool state_machine_idle = true;  // 如果状态机未启用，认为空闲
 #endif
-    
+
     // 检查是否有报警正在进行
     bool alarm_idle = true;  // 这里可以添加报警状态检查
-    
+
     bool detection_complete = sensor_idle && state_machine_idle && alarm_idle;
     
     if (detection_complete && g_low_power_manager.detection_start_time > 0) {
@@ -261,16 +283,16 @@ bool LowPower_IsDetectionComplete(void)
             printf("LOW_POWER: Detection completed (duration: %lu ms)\r\n", detection_duration);
             printf("LOW_POWER: === SCENARIO ANALYSIS END ===\r\n");
 
-            // 分析检测场景
-            if (detection_duration < 300) {
+            // 分析检测场景（更新为2000样本窗口）
+            if (detection_duration < 2200) {
                 printf("LOW_POWER: >>> SCENARIO 1: No vibration detected (quick completion)\r\n");
-                printf("LOW_POWER: >>> Expected: 200 samples -> Coarse detection [NOT TRIGGERED] -> Sleep\r\n");
-            } else if (detection_duration < 2000) {
+                printf("LOW_POWER: >>> Expected: 2000 samples (2s) -> Coarse detection [NOT TRIGGERED] -> Sleep\r\n");
+            } else if (detection_duration < 4000) {
                 printf("LOW_POWER: >>> SCENARIO 2: Normal vibration detected (moderate duration)\r\n");
-                printf("LOW_POWER: >>> Expected: 200 samples -> Coarse [TRIGGERED] -> 512 samples -> FFT -> Fine [NORMAL] -> Sleep\r\n");
+                printf("LOW_POWER: >>> Expected: 2000 samples -> Coarse [TRIGGERED] -> 512 samples -> FFT -> Fine [NORMAL] -> Sleep\r\n");
             } else {
-                printf("LOW_POWER: >>> SCENARIO 2/3: Complex analysis or alarm process\r\n");
-                printf("LOW_POWER: >>> Expected: Full detection chain with possible LoRa alarm\r\n");
+                printf("LOW_POWER: >>> SCENARIO 3: Mining vibration detected with alarm\r\n");
+                printf("LOW_POWER: >>> Expected: Full detection chain + LoRa alarm (~5-7 seconds)\r\n");
             }
             printf("LOW_POWER: >>> Power saving achieved: Sleep mode between detections\r\n");
         }
@@ -348,20 +370,20 @@ void LowPower_PrintStats(void)
  */
 void LowPower_PrintScenarios(void)
 {
-    printf("=== LOW POWER MODE SCENARIOS ===\r\n");
+    printf("=== LOW POWER MODE SCENARIOS (2000-sample window) ===\r\n");
     printf("SCENARIO 1: No Vibration\r\n");
-    printf("  Sleep -> RTC Wakeup -> 200 samples -> Coarse [NOT TRIGGERED] -> Sleep\r\n");
-    printf("  Duration: <300ms, Power saving: Maximum\r\n");
+    printf("  Sleep -> RTC Wakeup -> 2000 samples (2s) -> Coarse [NOT TRIGGERED] -> Sleep\r\n");
+    printf("  Duration: ~2000-2200ms, Power saving: Maximum\r\n");
     printf("\r\n");
     printf("SCENARIO 2: Normal Vibration\r\n");
-    printf("  Sleep -> RTC Wakeup -> 200 samples -> Coarse [TRIGGERED] -> 512 samples\r\n");
+    printf("  Sleep -> RTC Wakeup -> 2000 samples (2s) -> Coarse [TRIGGERED] -> 512 samples\r\n");
     printf("  -> FFT -> Fine detection [NORMAL] -> Sleep\r\n");
-    printf("  Duration: 300-2000ms, Power saving: Good\r\n");
+    printf("  Duration: 2200-4000ms, Power saving: Good\r\n");
     printf("\r\n");
     printf("SCENARIO 3: Mining Vibration\r\n");
-    printf("  Sleep -> RTC Wakeup -> 200 samples -> Coarse [TRIGGERED] -> 512 samples\r\n");
+    printf("  Sleep -> RTC Wakeup -> 2000 samples (2s) -> Coarse [TRIGGERED] -> 512 samples\r\n");
     printf("  -> FFT -> Fine detection [MINING] -> LoRa Alarm -> Sleep\r\n");
-    printf("  Duration: >2000ms, Power saving: Moderate (due to alarm)\r\n");
+    printf("  Duration: >4000ms (~5-7s), Power saving: Moderate (due to alarm)\r\n");
     printf("================================\r\n");
 }
 

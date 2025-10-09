@@ -173,6 +173,9 @@ int SetupInvDevice(struct inv_iim423xx_serif * icm_serif)
 #if ENABLE_COARSE_DETECTION
 	/* 初始化粗检测算法 */
 	printf("=== COARSE DETECTION INITIALIZATION ===\r\n");
+	printf("RMS Window Size: %d samples (%.1f seconds @ 1000Hz)\r\n", RMS_WINDOW_SIZE, RMS_WINDOW_SIZE / 1000.0f);
+	printf("Baseline RMS: %.6f g\r\n", BASELINE_RMS_THRESHOLD);
+	printf("Trigger Multiplier: %.1fx\r\n", TRIGGER_MULTIPLIER);
 	rc = Coarse_Detector_Init();
 	if(rc != 0) {
 		INV_MSG(INV_MSG_LEVEL_ERROR, "!!! ERROR : failed to initialize coarse detector.");
@@ -552,8 +555,8 @@ int Coarse_Detector_Process(float32_t filtered_sample)
         // 计算峰值因子
         coarse_detector.peak_factor = coarse_detector.current_rms / coarse_detector.baseline_rms;
 
-        // 每1000个样本输出一次调试信息
-        if (debug_counter % 1000 == 0) {
+        // 每2000个样本输出一次调试信息（窗口满一次）
+        if (debug_counter % 2000 == 0) {
             printf("COARSE_DEBUG: RMS=%.6f baseline=%.6f peak_factor=%.2f state=%d\r\n",
                    coarse_detector.current_rms, coarse_detector.baseline_rms,
                    coarse_detector.peak_factor, coarse_detector.state);
@@ -613,6 +616,14 @@ void Coarse_Detector_Reset(void)
         coarse_detector.window_full = false;
         memset(coarse_detector.rms_window, 0, sizeof(coarse_detector.rms_window));
     }
+}
+
+bool Coarse_Detector_IsWindowFull(void)
+{
+    if (!coarse_detector.is_initialized) {
+        return false;
+    }
+    return coarse_detector.window_full;
 }
 #endif
 

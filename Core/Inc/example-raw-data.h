@@ -47,7 +47,7 @@ typedef struct {
 
 #if ENABLE_COARSE_DETECTION
 /* 粗检测算法配置 */
-#define RMS_WINDOW_SIZE          200     // RMS滑动窗口大小 (200ms @ 1000Hz)
+#define RMS_WINDOW_SIZE          2000    // RMS滑动窗口大小 (2000ms @ 1000Hz) - 增加到2秒窗口
 #define BASELINE_RMS_THRESHOLD   0.001f  // 基线RMS阈值 (降低到1mg用于调试)
 #define TRIGGER_MULTIPLIER       1.5f    // 触发倍数 (降低到1.5x用于调试)
 #define TRIGGER_DURATION_MS      2000    // 触发持续时间 (2000ms)
@@ -206,6 +206,16 @@ coarse_detection_state_t Coarse_Detector_GetState(void);
  * This function resets the coarse detection algorithm to initial state.
  */
 void Coarse_Detector_Reset(void);
+
+/**
+ * \brief Check if coarse detection window is full
+ *
+ * This function checks if the RMS sliding window has collected enough samples
+ * to start detection. Useful for low-power mode to ensure sufficient data collection.
+ *
+ * \return true if window is full (2000 samples collected), false otherwise
+ */
+bool Coarse_Detector_IsWindowFull(void);
 #endif
 
 #if ENABLE_FINE_DETECTION
