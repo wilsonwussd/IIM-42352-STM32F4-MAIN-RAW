@@ -36,6 +36,10 @@ extern "C" {
 #ifndef ARM_MATH_CM4
 #define ARM_MATH_CM4
 #endif
+
+/* Low Power Mode Includes */
+#include "low_power_manager.h"
+#include "rtc_wakeup.h"
 /* USER CODE END Includes */
 
 /* Exported types ------------------------------------------------------------*/
@@ -62,6 +66,9 @@ void Error_Handler(void);
 
 /* PE14 GPIO Test Function */
 void Test_PE14_GPIO(void);
+
+/* Global variables */
+extern volatile uint32_t irq_from_device;
 /* USER CODE END EFP */
 
 /* Private defines -----------------------------------------------------------*/

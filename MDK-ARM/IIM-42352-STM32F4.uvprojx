@@ -414,6 +414,11 @@
               <FileType>1</FileType>
               <FilePath>..\Core\Src\clock_config_84mhz.c</FilePath>
             </File>
+            <File>
+              <FileName>low_power_manager.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\Core\Src\low_power_manager.c</FilePath>
+            </File>
           </Files>
         </Group>
         <Group>
@@ -513,6 +518,16 @@
               <FileName>stm32f4xx_ll_fsmc.c</FileName>
               <FileType>1</FileType>
               <FilePath>..\Drivers\STM32F4xx_HAL_Driver\Src\stm32f4xx_ll_fsmc.c</FilePath>
+            </File>
+            <File>
+              <FileName>stm32f4xx_hal_rtc.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\Drivers\STM32F4xx_HAL_Driver\Src\stm32f4xx_hal_rtc.c</FilePath>
+            </File>
+            <File>
+              <FileName>stm32f4xx_hal_rtc_ex.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\Drivers\STM32F4xx_HAL_Driver\Src\stm32f4xx_hal_rtc_ex.c</FilePath>
             </File>
           </Files>
         </Group>

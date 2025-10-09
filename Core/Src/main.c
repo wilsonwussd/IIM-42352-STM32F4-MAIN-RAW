@@ -101,6 +101,11 @@ UART_HandleTypeDef huart1;
 UART_HandleTypeDef huart5;
 
 /* USER CODE BEGIN PV */
+#if ENABLE_LOW_POWER_MODE
+/* External RTC handle from rtc_wakeup.c */
+extern RTC_HandleTypeDef hrtc;
+#endif
+
 /* LoRa Communication Variables */
 uint8_t lora_rx_buffer[64];
 uint8_t lora_tx_buffer[64];
@@ -138,6 +143,9 @@ static void MX_GPIO_Init(void);
 static void MX_SPI1_Init(void);
 static void MX_USART1_UART_Init(void);
 static void MX_UART5_Init(void);
+#if ENABLE_LOW_POWER_MODE
+static void MX_RTC_Init(void);
+#endif
 static void check_rc(int rc, const char * msg_context);
 void msg_printer(int level, const char * str, va_list ap);
 
@@ -166,7 +174,7 @@ int inv_io_hal_read_reg(struct inv_iim423xx_serif * serif, uint8_t reg, uint8_t 
 int inv_io_hal_write_reg(struct inv_iim423xx_serif * serif, uint8_t reg, const uint8_t * wbuffer, uint32_t wlen);
 
 /* Flag set from iim423xx device irq handler */
-static volatile int irq_from_device;
+volatile uint32_t irq_from_device;
 
 
 #define TO_MASK(a) (1U << (unsigned)(a))
@@ -237,6 +245,9 @@ int main(void)
   MX_SPI1_Init();
   MX_USART1_UART_Init();
   MX_UART5_Init();
+#if ENABLE_LOW_POWER_MODE
+  MX_RTC_Init();
+#endif
 //  /* USER CODE BEGIN 2 */
 
   // 强制延迟确保UART完全初始化
@@ -305,7 +316,8 @@ int main(void)
 	/* Initialize FFT Processor */
 	rc = FFT_Init(true, true); // Auto process enabled, windowing enabled
 	if (rc != 0) {
-		while(1);  // 初始化失败，停止运行
+		printf("!!! ERROR : failed to initialize FFT processor: %d\r\n", rc);
+		// while(1);  // 临时注释掉，允许程序继续执行
 	}
 
 #if ENABLE_COARSE_DETECTION
@@ -313,7 +325,7 @@ int main(void)
 	rc = FFT_SetTriggerMode(true);
 	if(rc != 0) {
 		printf("!!! ERROR : failed to enable FFT trigger mode.\r\n");
-		while(1);  // 触发模式启用失败，停止运行
+		// while(1);  // 临时注释掉，允许程序继续执行
 	}
 	printf("=== FFT TRIGGER MODE ENABLED ===\r\n");
 #endif
@@ -323,7 +335,7 @@ int main(void)
 	rc = Fine_Detector_Init();
 	if(rc != 0) {
 		printf("!!! ERROR : failed to initialize fine detector.\r\n");
-		while(1);  // 细检测初始化失败，停止运行
+		// while(1);  // 临时注释掉，允许程序继续执行
 	}
 	printf("=== FINE DETECTION ENABLED ===\r\n");
 #endif
@@ -333,15 +345,118 @@ int main(void)
 	rc = System_State_Machine_Init();
 	if(rc != 0) {
 		printf("!!! ERROR : failed to initialize system state machine.\r\n");
-		while(1);  // 状态机初始化失败，停止运行
+		// while(1);  // 临时注释掉，允许程序继续执行
 	}
 	printf("=== SYSTEM STATE MACHINE ENABLED ===\r\n");
+#endif
+
+#if ENABLE_LOW_POWER_MODE
+	/* 初始化低功耗管理 (阶段6) */
+	rc = LowPower_Init();
+	if(rc != 0) {
+		printf("!!! ERROR : failed to initialize low power manager: %d\r\n", rc);
+		while(1);  // 低功耗管理初始化失败，停止运行
+	}
+	printf("=== LOW POWER MODE ENABLED ===\r\n");
+	printf("LOW_POWER: Wakeup period: %d seconds\r\n", RTC_WAKEUP_PERIOD_SEC);
 #endif
 
 	/* Skip FFT Tests for production */
 	// FFT_RunAllTests();
 
   /* Infinite loop - 开始Z轴频域数据采集 */
+
+#if ENABLE_LOW_POWER_MODE
+	/* 低功耗模式主循环 */
+	printf("LOW_POWER: Starting low power main loop\r\n");
+
+	/* 显示三种场景说明 */
+	LowPower_PrintScenarios();
+
+	/* 给串口输出时间，然后启动RTC */
+	HAL_Delay(1000);
+	printf("LOW_POWER: Starting RTC wakeup timer...\r\n");
+
+	/* 启动RTC唤醒定时器 */
+	int rtc_ret = RTC_Wakeup_Start();
+	if (rtc_ret != 0) {
+		printf("LOW_POWER: ERROR - Failed to start RTC wakeup timer: %d\r\n", rtc_ret);
+		while(1);
+	}
+	printf("LOW_POWER: RTC wakeup timer started successfully\r\n");
+	HAL_Delay(500);  // 再给一点时间输出
+
+	do {
+		/* 检查是否有RTC唤醒事件 */
+		if (RTC_Wakeup_IsPending()) {
+			/* 处理RTC唤醒 */
+			LowPower_HandleWakeup();
+
+			/* 启动检测流程 */
+			LowPower_StartDetectionProcess();
+
+			/* 运行现有的检测流程直到完成 */
+			do {
+				/* Poll device for data */
+				if (irq_from_device & TO_MASK(INV_GPIO_INT1)) {
+					rc = GetDataFromInvDevice();
+					check_rc(rc, "error while processing FIFO");
+					irq_from_device &= ~TO_MASK(INV_GPIO_INT1);
+				}
+
+				/* Process upper computer commands */
+				if (uart1_rx_complete) {
+					Process_UART1_Command();
+					uart1_rx_complete = 0;
+					Start_UART1_Reception();
+				}
+
+				/* Process binary commands */
+				if (__HAL_UART_GET_FLAG(&huart1, UART_FLAG_RXNE)) {
+					uint8_t received_char = (uint8_t)(huart1.Instance->DR & 0xFF);
+					if (uart1_rx_index == 0) {
+						if (received_char == 0x10 || received_char == 0x11 ||
+						    received_char == 0x02 || received_char == 0x04) {
+							uart1_rx_buffer[uart1_rx_index] = received_char;
+							uart1_rx_index++;
+							uart1_rx_complete = 1;
+						}
+					} else {
+						uart1_rx_index = 0;
+					}
+				}
+
+				/* Process alarm state machine */
+				Process_Alarm_State_Machine();
+
+#if ENABLE_SYSTEM_STATE_MACHINE
+				/* Process system state machine */
+				System_State_Machine_Process();
+#endif
+
+				/* 短暂延时避免CPU占用过高 */
+				HAL_Delay(1);
+
+			} while (!LowPower_IsDetectionComplete());
+
+			/* 检测完成，打印统计信息 */
+			if (LOW_POWER_DEBUG_ENABLED) {
+				static uint32_t stats_counter = 0;
+				stats_counter++;
+				if (stats_counter % 10 == 0) {  // 每10次检测打印一次统计
+					LowPower_PrintStats();
+				}
+			}
+		}
+
+		/* 进入Sleep模式等待下次唤醒 */
+		LowPower_EnterSleep();
+
+	} while(1);
+
+#else
+	/* 连续模式主循环（现有v4.0逻辑） */
+	printf("CONTINUOUS_MODE: Starting continuous main loop\r\n");
 
 	do {
 		/* Poll device for data */
@@ -397,12 +512,14 @@ int main(void)
 		if (HAL_GetTick() - last_test_time > 10000) {
 			last_test_time = HAL_GetTick();
 			// Simple_Protocol_Test();  // 暂时禁用测试数据
+			printf("CONTINUOUS_MODE: System running normally (tick: %lu)\r\n", HAL_GetTick());
 		}
 
-		// ?????????????CPU
+		// 短暂延时避免CPU占用过高
 		HAL_Delay(1);
 
 	} while(1);
+#endif
   /* USER CODE BEGIN WHILE */
   while (1)
   {
@@ -775,10 +892,27 @@ void Error_Handler(void)
 {
   /* USER CODE BEGIN Error_Handler_Debug */
   /* User can add his own implementation to report the HAL error return state */
-  __disable_irq();
-  while (1)
-  {
+  // 临时注释掉无限循环，允许程序继续执行以便调试
+  // __disable_irq();
+  // while (1)
+  // {
+  // }
+
+  // 尝试通过GPIO指示错误（如果可能的话）
+  // 切换PE14引脚状态来指示错误
+  static int error_count = 0;
+  error_count++;
+
+  // 如果GPIOE已经初始化，切换PE14
+  if (__HAL_RCC_GPIOE_IS_CLK_ENABLED()) {
+    for (int i = 0; i < error_count && i < 10; i++) {
+      HAL_GPIO_WritePin(GPIOE, GPIO_PIN_14, GPIO_PIN_SET);
+      for (volatile int j = 0; j < 100000; j++);
+      HAL_GPIO_WritePin(GPIOE, GPIO_PIN_14, GPIO_PIN_RESET);
+      for (volatile int j = 0; j < 100000; j++);
+    }
   }
+
   /* USER CODE END Error_Handler_Debug */
 }
 
@@ -1281,6 +1415,24 @@ void Process_UART1_Command(void)
                 // 继续发送FFT数据（已经在主循环中处理）
                 break;
 
+#if ENABLE_LOW_POWER_MODE
+            case 0x20:  // 低功耗统计命令
+                LowPower_PrintStats();
+                RTC_Wakeup_PrintStats();
+                Send_Response_To_PC("LOW_POWER_STATS_PRINTED");
+                break;
+
+            case 0x21:  // 设置连续模式
+                LowPower_SetMode(POWER_MODE_CONTINUOUS);
+                Send_Response_To_PC("MODE_SET_CONTINUOUS");
+                break;
+
+            case 0x22:  // 设置低功耗模式
+                LowPower_SetMode(POWER_MODE_LOW_POWER);
+                Send_Response_To_PC("MODE_SET_LOW_POWER");
+                break;
+#endif
+
             default:
                 // 未知命令
                 break;
@@ -1357,6 +1509,50 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
         }
     }
 }
+
+
+
+#if ENABLE_LOW_POWER_MODE
+/**
+  * @brief RTC Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_RTC_Init(void)
+{
+  /* USER CODE BEGIN RTC_Init 0 */
+
+  /* USER CODE END RTC_Init 0 */
+
+  /* USER CODE BEGIN RTC_Init 1 */
+
+  /* USER CODE END RTC_Init 1 */
+
+  /** Initialize RTC Only
+  */
+  hrtc.Instance = RTC;
+  hrtc.Init.HourFormat = RTC_HOURFORMAT_24;
+  hrtc.Init.AsynchPrediv = 124;    // LSI (32kHz) / (124+1) = 256Hz
+  hrtc.Init.SynchPrediv = 255;     // 256Hz / (255+1) = 1Hz
+  hrtc.Init.OutPut = RTC_OUTPUT_DISABLE;
+  hrtc.Init.OutPutPolarity = RTC_OUTPUT_POLARITY_HIGH;
+  hrtc.Init.OutPutType = RTC_OUTPUT_TYPE_OPENDRAIN;
+  if (HAL_RTC_Init(&hrtc) != HAL_OK)
+  {
+    printf("ERROR: RTC initialization failed\r\n");
+    // 不调用Error_Handler，允许程序继续运行
+  }
+  else
+  {
+    printf("RTC initialized successfully\r\n");
+  }
+
+  /* USER CODE BEGIN RTC_Init 2 */
+
+  /* USER CODE END RTC_Init 2 */
+
+}
+#endif
 
 /* USER CODE END 4 */
 

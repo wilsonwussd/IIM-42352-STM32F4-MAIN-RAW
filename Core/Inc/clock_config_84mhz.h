@@ -63,6 +63,7 @@ void Clock_Config_Verify(void);
 void Clock_Performance_Test(void);
 uint32_t Get_Current_SYSCLK_Freq(void);
 void Print_Clock_Info(void);
+void Full_84MHz_Test(void);
 
 /* 时钟配置结构体 */
 typedef struct {

@@ -295,6 +295,13 @@ typedef enum {
     STATE_ALARM_COMPLETE,            // 报警完成
     STATE_ERROR_HANDLING,            // 错误处理
     STATE_SYSTEM_RESET,              // 系统重置
+
+    // 低功耗模式新增状态
+    STATE_LOW_POWER_SLEEP_PREPARE,   // 准备进入低功耗Sleep
+    STATE_LOW_POWER_SLEEP_MODE,      // 低功耗Sleep模式
+    STATE_LOW_POWER_WAKEUP,          // 低功耗唤醒
+    STATE_LOW_POWER_DETECTION_ACTIVE,// 低功耗检测活跃状态
+
     STATE_COUNT                      // 状态总数
 } system_state_t;
 
