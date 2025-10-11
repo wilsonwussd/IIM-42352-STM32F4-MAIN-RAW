@@ -836,8 +836,10 @@ static float32_t calculate_confidence_score(const fine_detection_features_t* fea
                                (features->low_freq_energy / FINE_DETECTION_LOW_FREQ_THRESHOLD) : 0.0f;
     if (low_freq_score > 1.0f) low_freq_score = 1.0f;
 
-    // 中频能量得分：只要超过阈值就给满分
-    float32_t mid_freq_score = (features->mid_freq_energy >= FINE_DETECTION_MID_FREQ_THRESHOLD) ? 1.0f : 0.0f;
+    // 中频能量得分：改为渐进式得分，而不是二元判定
+    // 这样可以更好地反映中频能量的贡献
+    float32_t mid_freq_score = (features->mid_freq_energy / FINE_DETECTION_MID_FREQ_THRESHOLD);
+    if (mid_freq_score > 1.0f) mid_freq_score = 1.0f;
 
     float32_t dominant_freq_score = (features->dominant_frequency < FINE_DETECTION_DOMINANT_FREQ_MAX) ?
                                    (FINE_DETECTION_DOMINANT_FREQ_MAX - features->dominant_frequency) / FINE_DETECTION_DOMINANT_FREQ_MAX : 0.0f;

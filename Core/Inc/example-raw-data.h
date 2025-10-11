@@ -241,11 +241,11 @@ bool Coarse_Detector_IsWindowFull(void);
 #define FINE_DETECTION_HIGH_FREQ_MAX   100.0f   // 高频段上限 (Hz)
 
 /* 分类阈值配置 */
-#define FINE_DETECTION_LOW_FREQ_THRESHOLD     0.4f    // 低频能量阈值
-#define FINE_DETECTION_MID_FREQ_THRESHOLD     0.2f    // 中频能量阈值
+#define FINE_DETECTION_LOW_FREQ_THRESHOLD     0.4f    // 低频能量阈值（40%）
+#define FINE_DETECTION_MID_FREQ_THRESHOLD     0.05f   // 中频能量阈值（5%，降低以适应真实挖掘振动）
 #define FINE_DETECTION_DOMINANT_FREQ_MAX      50.0f   // 主频上限 (Hz)
 #define FINE_DETECTION_CENTROID_MAX           80.0f   // 频谱重心上限 (Hz)
-#define FINE_DETECTION_CONFIDENCE_THRESHOLD   0.85f   // 置信度阈值（提高到0.85以降低误报率）
+#define FINE_DETECTION_CONFIDENCE_THRESHOLD   0.75f   // 置信度阈值（降低到0.75以提高检测灵敏度）
 
 /* 分类结果定义 */
 typedef enum {
