@@ -97,6 +97,19 @@ bool FFT_IsReady(void);
 int FFT_Process(void);
 
 /**
+ * @brief Process FFT computation from external buffer (新架构)
+ *
+ * This function processes FFT directly from an external buffer (e.g., coarse detector buffer)
+ * without using the internal circular buffer. This ensures data synchronization between
+ * coarse detection and FFT processing.
+ *
+ * @param buffer: Pointer to external buffer containing time-domain samples
+ * @param buffer_size: Size of the buffer (must be FFT_SIZE = 512)
+ * @return 0 on success, negative on error
+ */
+int FFT_ProcessBuffer(const float32_t* buffer, uint32_t buffer_size);
+
+/**
  * @brief Get the last FFT computation results
  * @return Pointer to fft_result_t structure
  */

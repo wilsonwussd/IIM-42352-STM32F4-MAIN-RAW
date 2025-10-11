@@ -329,31 +329,66 @@ void HandleInvDeviceFifoPacket(inv_iim423xx_sensor_event_t * event)
 		// 粗检测算法处理
 		int trigger_detected = Coarse_Detector_Process(filtered_z_g);
 
-		// 阶段3：使用FFT触发控制
-		// FFT应该在TRIGGERED和COOLDOWN状态下都保持激活
-		coarse_detection_state_t current_state = Coarse_Detector_GetState();
-		bool should_trigger = (trigger_detected ||
-		                      current_state == COARSE_STATE_TRIGGERED ||
-		                      current_state == COARSE_STATE_COOLDOWN);
-		FFT_SetTriggerState(should_trigger);
+		// 新架构：粗检测触发时，直接使用粗检测缓冲区进行FFT
+		if (trigger_detected) {
+			printf("=== NEW ARCHITECTURE: Coarse detection triggered! ===\r\n");
 
-		// 调试输出FFT触发状态
-		static uint32_t fft_debug_counter = 0;
-		fft_debug_counter++;
-		if (fft_debug_counter % 1000 == 0) {
-			printf("FFT_DEBUG: should_trigger=%d state=%d\r\n", should_trigger, current_state);
+			// 获取粗检测缓冲区
+			uint32_t buffer_size = 0;
+			const float32_t* coarse_buffer = Coarse_Detector_GetBuffer(&buffer_size);
+
+			if (coarse_buffer != NULL && buffer_size == FFT_SIZE) {
+				printf("NEW_ARCH: Got coarse buffer with %lu samples, processing FFT...\r\n", buffer_size);
+
+				// 直接使用粗检测缓冲区进行FFT处理
+				int fft_result = FFT_ProcessBuffer(coarse_buffer, buffer_size);
+
+				if (fft_result == 0) {
+					printf("NEW_ARCH: FFT processing successful!\r\n");
+
+					// 获取FFT结果
+					const fft_result_t* result_ptr = FFT_GetResults();
+					if (result_ptr != NULL) {
+						printf("NEW_ARCH: FFT Results - freq=%.2f Hz, mag=%.6f, energy=%.6f\r\n",
+						       result_ptr->dominant_frequency,
+						       result_ptr->dominant_magnitude,
+						       result_ptr->total_energy);
+
+						// 调用精检测
+						fine_detection_features_t features;
+						int fine_result = Fine_Detector_Process(
+							result_ptr->magnitude_spectrum,
+							FFT_OUTPUT_POINTS,
+							result_ptr->dominant_frequency,
+							&features
+						);
+
+						if (fine_result == 0) {
+							printf("NEW_ARCH: Fine detection complete!\r\n");
+						} else {
+							printf("NEW_ARCH: Fine detection failed with error %d\r\n", fine_result);
+						}
+					} else {
+						printf("NEW_ARCH: ERROR - Failed to get FFT results\r\n");
+					}
+				} else {
+					printf("NEW_ARCH: ERROR - FFT processing failed with error %d\r\n", fft_result);
+				}
+			} else {
+				printf("NEW_ARCH: ERROR - Failed to get coarse buffer (buffer=%p, size=%lu)\r\n",
+				       coarse_buffer, buffer_size);
+			}
 		}
-
-		// FFT处理现在由触发状态自动控制
-		int result = FFT_AddSample(filtered_z_g);
 #else
-		// 使用滤波后的数据进行FFT处理 (连续模式)
-		int result = FFT_AddSample(filtered_z_g);
+		// 连续模式：不使用粗检测，直接使用FFT（保留用于向后兼容）
+		// 注意：新架构下不推荐使用此模式
+		printf("WARNING: Continuous mode without coarse detection is not recommended in new architecture\r\n");
 #endif
 
 #else
 		// 原始处理方式 (向后兼容)
-		int result = FFT_AddSample(accel_z_g);
+		// 注意：新架构下不推荐使用此模式
+		printf("WARNING: Raw data mode without preprocessing is not recommended in new architecture\r\n");
 #endif
 
 		// 数据处理完成 - 阶段1高通滤波器工作正常，阶段2粗检测集成
@@ -536,8 +571,9 @@ int Coarse_Detector_Process(float32_t filtered_sample)
         return 0;
     }
 
-    // 添加样本到RMS滑动窗口
-    coarse_detector.rms_window[coarse_detector.window_index] = filtered_sample * filtered_sample;  // 平方值
+    // 新架构：存储原始样本值（不是平方值），用于FFT处理
+    // RMS计算时再平方
+    coarse_detector.rms_window[coarse_detector.window_index] = filtered_sample;  // 原始值
     coarse_detector.window_index = (coarse_detector.window_index + 1) % RMS_WINDOW_SIZE;
 
     if (!coarse_detector.window_full && coarse_detector.window_index == 0) {
@@ -549,15 +585,17 @@ int Coarse_Detector_Process(float32_t filtered_sample)
     if (coarse_detector.window_full) {
         float32_t sum_squares = 0.0f;
         for (int i = 0; i < RMS_WINDOW_SIZE; i++) {
-            sum_squares += coarse_detector.rms_window[i];
+            // 计算RMS时再平方
+            float32_t sample = coarse_detector.rms_window[i];
+            sum_squares += sample * sample;
         }
         coarse_detector.current_rms = sqrtf(sum_squares / RMS_WINDOW_SIZE);
 
         // 计算峰值因子
         coarse_detector.peak_factor = coarse_detector.current_rms / coarse_detector.baseline_rms;
 
-        // 每2000个样本输出一次调试信息（窗口满一次）
-        if (debug_counter % 2000 == 0) {
+        // 每512个样本输出一次调试信息（窗口满一次）
+        if (debug_counter % 512 == 0) {
             printf("COARSE_DEBUG: RMS=%.6f baseline=%.6f peak_factor=%.2f state=%d\r\n",
                    coarse_detector.current_rms, coarse_detector.baseline_rms,
                    coarse_detector.peak_factor, coarse_detector.state);
@@ -626,6 +664,21 @@ bool Coarse_Detector_IsWindowFull(void)
     }
     return coarse_detector.window_full;
 }
+
+const float32_t* Coarse_Detector_GetBuffer(uint32_t* buffer_size)
+{
+    if (!coarse_detector.is_initialized || !coarse_detector.window_full) {
+        printf("COARSE_BUFFER: Cannot get buffer - not initialized or window not full\r\n");
+        return NULL;
+    }
+
+    if (buffer_size != NULL) {
+        *buffer_size = RMS_WINDOW_SIZE;
+    }
+
+    printf("COARSE_BUFFER: Returning buffer with %d samples\r\n", RMS_WINDOW_SIZE);
+    return coarse_detector.rms_window;
+}
 #endif
 
 #if ENABLE_FINE_DETECTION
@@ -671,10 +724,19 @@ static float32_t calculate_total_energy(const float32_t* magnitude_spectrum,
 {
     float32_t total_energy = 0.0f;
 
-    // 跳过DC分量 (bin 0)，从bin 1开始计算
-    for (uint32_t i = 1; i < spectrum_length; i++) {
+    // 排除低频噪音：只计算5Hz以上的能量
+    // FFT频率分辨率：1.953125 Hz
+    // 5Hz对应的bin: 5 / 1.953125 ≈ 2.56 → 向上取整到 bin 3 (5.86 Hz)
+    const float32_t freq_resolution = 1000.0f / 512.0f;  // 1.953125 Hz
+    const uint32_t min_bin = (uint32_t)((5.0f / freq_resolution) + 0.5f);  // 向上取整到 bin 3
+
+    // 从5Hz以上开始计算，排除0-5Hz的噪音（包括2Hz噪音）
+    for (uint32_t i = min_bin; i < spectrum_length; i++) {
         total_energy += magnitude_spectrum[i] * magnitude_spectrum[i];
     }
+
+    printf("TOTAL_ENERGY_DEBUG: Calculated from bin %lu (%.2f Hz) to bin %lu, energy=%.6f\r\n",
+           min_bin, min_bin * freq_resolution, spectrum_length - 1, total_energy);
 
     return total_energy;
 }
@@ -687,8 +749,10 @@ static float32_t calculate_spectral_centroid(const float32_t* magnitude_spectrum
     float32_t weighted_sum = 0.0f;
     float32_t magnitude_sum = 0.0f;
 
-    // 跳过DC分量，从bin 1开始计算
-    for (uint32_t i = 1; i < spectrum_length; i++) {
+    // 排除低频噪音：从5Hz以上开始计算
+    const uint32_t min_bin = (uint32_t)((5.0f / freq_resolution) + 0.5f);  // 向上取整到 bin 3 (5.86 Hz)
+
+    for (uint32_t i = min_bin; i < spectrum_length; i++) {
         float32_t frequency = i * freq_resolution;
         float32_t magnitude_squared = magnitude_spectrum[i] * magnitude_spectrum[i];
 
@@ -789,9 +853,33 @@ int Fine_Detector_Process(const float32_t* magnitude_spectrum,
     // 计算置信度
     features->confidence_score = calculate_confidence_score(features);
 
-    // 分类决策
-    features->classification = (features->confidence_score >= FINE_DETECTION_CONFIDENCE_THRESHOLD) ?
-                              FINE_DETECTION_MINING : FINE_DETECTION_NORMAL;
+    // 详细调试输出
+    printf("FINE_DETECTION_DEBUG: ===== Feature Analysis =====\r\n");
+    printf("  Low Freq Energy (5-15Hz):  %.6f (threshold: %.2f)\r\n",
+           features->low_freq_energy, FINE_DETECTION_LOW_FREQ_THRESHOLD);
+    printf("  Mid Freq Energy (15-30Hz): %.6f (threshold: %.2f)\r\n",
+           features->mid_freq_energy, FINE_DETECTION_MID_FREQ_THRESHOLD);
+    printf("  High Freq Energy (30-100Hz): %.6f\r\n", features->high_freq_energy);
+    printf("  Dominant Frequency: %.2f Hz (max: %.2f Hz)\r\n",
+           features->dominant_frequency, FINE_DETECTION_DOMINANT_FREQ_MAX);
+    printf("  Spectral Centroid: %.2f Hz (max: %.2f Hz)\r\n",
+           features->spectral_centroid, FINE_DETECTION_CENTROID_MAX);
+    printf("  Confidence Score: %.4f (threshold: %.2f)\r\n",
+           features->confidence_score, FINE_DETECTION_CONFIDENCE_THRESHOLD);
+
+    // 分类决策：添加主频过滤，排除低频噪音
+    // 如果主频 < 5Hz，很可能是2Hz噪音，直接判定为正常振动
+    if (features->dominant_frequency < 5.0f) {
+        features->classification = FINE_DETECTION_NORMAL;
+        printf("  >>> NOISE FILTER: Dominant freq < 5Hz, classified as NORMAL (likely 2Hz noise)\r\n");
+    } else {
+        features->classification = (features->confidence_score >= FINE_DETECTION_CONFIDENCE_THRESHOLD) ?
+                                  FINE_DETECTION_MINING : FINE_DETECTION_NORMAL;
+    }
+
+    printf("  Classification: %s\r\n",
+           (features->classification == FINE_DETECTION_MINING) ? "MINING" : "NORMAL");
+    printf("FINE_DETECTION_DEBUG: =============================\r\n");
 
     // 性能统计
     features->analysis_timestamp = HAL_GetTick();

@@ -71,20 +71,40 @@ int FFT_Init(bool auto_process, bool window_enabled)
 
 int FFT_AddSample(float32_t sample)
 {
+    static uint32_t add_sample_call_count = 0;
+    add_sample_call_count++;
+
     if (!is_initialized) {
+        if (add_sample_call_count % 1000 == 0) {
+            printf("FFT_ADD_SAMPLE_DEBUG: Not initialized! call_count=%lu\r\n", add_sample_call_count);
+        }
         return -1; // Not initialized
     }
 
     // Skip adding samples if currently processing or completed (wait for reset)
     if (fft_processor.state == FFT_STATE_PROCESSING) {
+        if (add_sample_call_count % 1000 == 0) {
+            printf("FFT_ADD_SAMPLE_DEBUG: State is PROCESSING, skipping. call_count=%lu\r\n", add_sample_call_count);
+        }
         return 0; // Ignore samples during processing
     }
 
-    // Stage 3: Check if we should process samples based on trigger mode
-    if (fft_processor.trigger_mode && !fft_processor.is_triggered) {
-        // In trigger mode but not triggered: skip sample collection to save power
-        return 0;
+    // Debug: Print state every 1000 calls
+    if (add_sample_call_count % 1000 == 0) {
+        printf("FFT_ADD_SAMPLE_DEBUG: call_count=%lu, sample_count=%lu, state=%d, trigger_mode=%d, is_triggered=%d\r\n",
+               add_sample_call_count, fft_processor.sample_count, fft_processor.state,
+               fft_processor.trigger_mode, fft_processor.is_triggered);
     }
+
+    // 修改触发模式逻辑：
+    // 在触发模式下，应该一直采集样本到循环缓冲区
+    // 只是在未触发时不自动处理FFT
+    // 这样当触发时，缓冲区已经有最近的数据了
+    // Stage 3: Check if we should process samples based on trigger mode
+    // if (fft_processor.trigger_mode && !fft_processor.is_triggered) {
+    //     // In trigger mode but not triggered: skip sample collection to save power
+    //     return 0;
+    // }
 
     // Add sample to circular buffer
     fft_processor.time_buffer[fft_processor.buffer_index] = sample;
@@ -97,17 +117,139 @@ int FFT_AddSample(float32_t sample)
 
     // Update state based on buffer fill
     if (fft_processor.sample_count >= FFT_BUFFER_SIZE) {
+        // 如果状态不是READY，则设置为READY
         if (fft_processor.state == FFT_STATE_IDLE || fft_processor.state == FFT_STATE_COLLECTING) {
             fft_processor.state = FFT_STATE_READY;
+        }
 
+        // 如果状态是READY，检查是否应该自动处理
+        if (fft_processor.state == FFT_STATE_READY) {
             // Auto process if enabled and (not in trigger mode OR triggered)
-            if (fft_processor.auto_process && (!fft_processor.trigger_mode || fft_processor.is_triggered)) {
+            bool should_auto_process = fft_processor.auto_process && (!fft_processor.trigger_mode || fft_processor.is_triggered);
+
+            // Debug: Print auto-process decision
+            static uint32_t auto_process_check_count = 0;
+            auto_process_check_count++;
+            if (auto_process_check_count % 100 == 0) {
+                printf("FFT_AUTO_PROCESS_CHECK: auto_process=%d, trigger_mode=%d, is_triggered=%d, should_process=%d, state=%d\r\n",
+                       fft_processor.auto_process, fft_processor.trigger_mode, fft_processor.is_triggered, should_auto_process, fft_processor.state);
+            }
+
+            if (should_auto_process) {
+                printf("FFT_AUTO_PROCESS: Calling FFT_Process()...\r\n");
                 return FFT_Process();
             }
         }
     } else {
         fft_processor.state = FFT_STATE_COLLECTING;
     }
+
+    return 0;
+}
+
+int FFT_ProcessBuffer(const float32_t* buffer, uint32_t buffer_size)
+{
+    printf("FFT_PROCESS_BUFFER: Called with buffer_size=%lu\r\n", buffer_size);
+
+    if (!is_initialized) {
+        printf("FFT_PROCESS_BUFFER: ERROR - FFT not initialized\r\n");
+        return -1;
+    }
+
+    if (buffer == NULL) {
+        printf("FFT_PROCESS_BUFFER: ERROR - NULL buffer pointer\r\n");
+        return -2;
+    }
+
+    if (buffer_size != FFT_SIZE) {
+        printf("FFT_PROCESS_BUFFER: ERROR - buffer_size=%lu, expected FFT_SIZE=%d\r\n",
+               buffer_size, FFT_SIZE);
+        return -3;
+    }
+
+    printf("FFT_PROCESS_BUFFER: Starting FFT processing from external buffer...\r\n");
+    fft_processor.state = FFT_STATE_PROCESSING;
+
+    // Debug: Calculate RMS of input data
+    float32_t sum_squares = 0.0f;
+    float32_t max_val = 0.0f;
+    float32_t min_val = 0.0f;
+
+    // Copy buffer to FFT input and calculate statistics
+    for (uint32_t i = 0; i < FFT_SIZE; i++) {
+        float32_t sample = buffer[i];
+        fft_processor.fft_input[2*i] = sample; // Real part
+        fft_processor.fft_input[2*i + 1] = 0.0f; // Imaginary part
+
+        // Calculate statistics
+        sum_squares += sample * sample;
+        if (i == 0 || sample > max_val) max_val = sample;
+        if (i == 0 || sample < min_val) min_val = sample;
+    }
+
+    float32_t input_rms = sqrtf(sum_squares / FFT_SIZE);
+    printf("FFT_PROCESS_BUFFER: Input RMS=%.6f, Max=%.6f, Min=%.6f, Range=%.6f\r\n",
+           input_rms, max_val, min_val, max_val - min_val);
+
+    // Apply windowing if enabled
+    if (fft_processor.window_enabled) {
+        for (uint32_t i = 0; i < FFT_SIZE; i++) {
+            fft_processor.fft_input[2*i] *= hanning_window[i];
+        }
+        printf("FFT_PROCESS_BUFFER: Applied Hanning window\r\n");
+    }
+
+    // Perform FFT using CMSIS DSP
+    arm_cfft_f32(&arm_cfft_sR_f32_len512, fft_processor.fft_input, 0, 1);
+
+    // Calculate magnitude spectrum
+    arm_cmplx_mag_f32(fft_processor.fft_input, fft_processor.fft_output, FFT_SIZE);
+
+    // Copy magnitude spectrum to result (257 points: 0 to Nyquist frequency)
+    for (uint32_t i = 0; i < FFT_OUTPUT_POINTS; i++) {
+        // 1. FFT归一化 (除以FFT_SIZE)
+        float32_t normalized_magnitude = fft_processor.fft_output[i] / (float32_t)FFT_SIZE;
+
+        // 2. 双边谱转单边谱 (除DC和Nyquist外乘以2)
+        if (i > 0 && i < FFT_SIZE/2) {
+            normalized_magnitude *= 2.0f;
+        }
+
+        // 3. 传感器特性缩放
+        normalized_magnitude *= 0.001f;
+
+        // 4. 存储结果
+        fft_processor.last_result.magnitude_spectrum[i] = normalized_magnitude;
+    }
+
+    // Analyze results (pass full spectrum, function will skip DC internally)
+    find_dominant_frequency(fft_processor.last_result.magnitude_spectrum, FFT_OUTPUT_POINTS,
+                           &fft_processor.last_result.dominant_frequency,
+                           &fft_processor.last_result.dominant_magnitude);
+
+    // Calculate total energy
+    fft_processor.last_result.total_energy = 0.0f;
+    for (uint32_t i = 0; i < FFT_OUTPUT_POINTS; i++) {
+        fft_processor.last_result.total_energy +=
+            fft_processor.last_result.magnitude_spectrum[i] * fft_processor.last_result.magnitude_spectrum[i];
+    }
+
+    // Fill frequency bins
+    for (uint32_t i = 0; i < FFT_OUTPUT_POINTS; i++) {
+        fft_processor.last_result.frequency_bins[i] = FFT_BinToFrequency(i);
+    }
+
+    // Store metadata
+    fft_processor.last_result.sample_count = FFT_SIZE;
+    fft_processor.last_result.timestamp = HAL_GetTick();
+
+    // Update state
+    fft_processor.state = FFT_STATE_COMPLETE;
+
+    printf("FFT_PROCESS_BUFFER: Complete! freq=%.2fHz mag=%.6f energy=%.6f\r\n",
+           fft_processor.last_result.dominant_frequency,
+           fft_processor.last_result.dominant_magnitude,
+           fft_processor.last_result.total_energy);
 
     return 0;
 }
@@ -120,19 +262,41 @@ bool FFT_IsReady(void)
 
 int FFT_Process(void)
 {
+    printf("FFT_PROCESS_DEBUG: Called! sample_count=%lu, state=%d\r\n",
+           fft_processor.sample_count, fft_processor.state);
+
     if (!is_initialized || fft_processor.sample_count < FFT_BUFFER_SIZE) {
+        printf("FFT_PROCESS_DEBUG: Not ready! is_initialized=%d, sample_count=%lu, FFT_BUFFER_SIZE=%d\r\n",
+               is_initialized, fft_processor.sample_count, FFT_BUFFER_SIZE);
         return -1; // Not ready
     }
-    
+
+    printf("FFT_PROCESS_DEBUG: Starting FFT processing...\r\n");
     fft_processor.state = FFT_STATE_PROCESSING;
     
     // Prepare FFT input buffer (copy from circular buffer in correct order)
     uint32_t start_index = fft_processor.buffer_index; // Oldest sample
+
+    // Debug: Calculate RMS of FFT input data
+    float32_t sum_squares = 0.0f;
+    float32_t max_val = 0.0f;
+    float32_t min_val = 0.0f;
+
     for (uint32_t i = 0; i < FFT_SIZE; i++) {
         uint32_t src_index = (start_index + i) % FFT_BUFFER_SIZE;
-        fft_processor.fft_input[2*i] = fft_processor.time_buffer[src_index]; // Real part
+        float32_t sample = fft_processor.time_buffer[src_index];
+        fft_processor.fft_input[2*i] = sample; // Real part
         fft_processor.fft_input[2*i + 1] = 0.0f; // Imaginary part (zero for real input)
+
+        // Calculate statistics
+        sum_squares += sample * sample;
+        if (i == 0 || sample > max_val) max_val = sample;
+        if (i == 0 || sample < min_val) min_val = sample;
     }
+
+    float32_t input_rms = sqrtf(sum_squares / FFT_SIZE);
+    printf("FFT_INPUT_DEBUG: RMS=%.6f, Max=%.6f, Min=%.6f, Range=%.6f\r\n",
+           input_rms, max_val, min_val, max_val - min_val);
     
     // Apply windowing if enabled
     if (fft_processor.window_enabled) {
@@ -167,13 +331,10 @@ int FFT_Process(void)
         fft_processor.last_result.magnitude_spectrum[i] = normalized_magnitude;
     }
 
-    // Analyze results (exclude DC component for peak detection)
-    find_dominant_frequency(&fft_processor.last_result.magnitude_spectrum[1], FFT_OUTPUT_POINTS-1,
+    // Analyze results (pass full spectrum, function will skip DC internally)
+    find_dominant_frequency(fft_processor.last_result.magnitude_spectrum, FFT_OUTPUT_POINTS,
                            &fft_processor.last_result.dominant_frequency,
                            &fft_processor.last_result.dominant_magnitude);
-
-    // Adjust dominant frequency to account for skipped DC component
-    fft_processor.last_result.dominant_frequency += FREQUENCY_RESOLUTION;
 
     fft_processor.last_result.total_energy =
         calculate_total_energy(fft_processor.last_result.magnitude_spectrum, FFT_OUTPUT_POINTS);
@@ -295,6 +456,9 @@ static void find_dominant_frequency(const float32_t* magnitude_spectrum, uint32_
 
     *freq = FFT_BinToFrequency(max_index);
     *magnitude = max_value;
+
+    printf("DOMINANT_FREQ_DEBUG: max_index=%lu (bin %lu), freq=%.2f Hz, mag=%.6f\r\n",
+           max_index, max_index, *freq, *magnitude);
 }
 
 // Find multiple frequency peaks (similar to the reference chart)
@@ -494,9 +658,17 @@ int FFT_SetTriggerState(bool triggered)
     bool previous_state = fft_processor.is_triggered;
     fft_processor.is_triggered = triggered;
 
+    // 注释掉重置逻辑：粗检测触发时不应该清空FFT缓冲区
+    // 因为FFT缓冲区应该一直在采集数据，触发时应该使用已有的数据
     // If transitioning from not triggered to triggered, reset FFT for fresh data
+    // if (!previous_state && triggered) {
+    //     FFT_Reset();
+    // }
+
+    // 新逻辑：触发时打印调试信息
     if (!previous_state && triggered) {
-        FFT_Reset();
+        printf("FFT_TRIGGER: Triggered! sample_count=%lu, state=%d\r\n",
+               fft_processor.sample_count, fft_processor.state);
     }
 
     return 0;

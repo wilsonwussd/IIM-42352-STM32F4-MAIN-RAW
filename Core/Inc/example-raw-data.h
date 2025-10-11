@@ -46,11 +46,11 @@ typedef struct {
 #endif
 
 #if ENABLE_COARSE_DETECTION
-/* 粗检测算法配置 */
-#define RMS_WINDOW_SIZE          2000    // RMS滑动窗口大小 (2000ms @ 1000Hz) - 增加到2秒窗口
-#define BASELINE_RMS_THRESHOLD   0.001f  // 基线RMS阈值 (降低到1mg用于调试)
-#define TRIGGER_MULTIPLIER       1.5f    // 触发倍数 (降低到1.5x用于调试)
-#define TRIGGER_DURATION_MS      2000    // 触发持续时间 (2000ms)
+/* 粗检测算法配置 - 新架构：与FFT共享512样本缓冲区 */
+#define RMS_WINDOW_SIZE          512     // RMS滑动窗口大小 (512样本 @ 1000Hz = 0.512秒) - 与FFT_SIZE一致
+#define BASELINE_RMS_THRESHOLD   0.010f  // 基线RMS阈值 (10mg，避免误触发)
+#define TRIGGER_MULTIPLIER       3.0f    // 触发倍数 (3.0x，需要30mg以上才触发)
+#define TRIGGER_DURATION_MS      512     // 触发持续时间 (512ms，与窗口大小一致)
 #define COOLDOWN_TIME_MS         10000   // 冷却时间 (10000ms)
 
 /* 粗检测状态枚举 */
@@ -201,6 +201,18 @@ int Coarse_Detector_Process(float32_t filtered_sample);
 coarse_detection_state_t Coarse_Detector_GetState(void);
 
 /**
+ * \brief Get pointer to coarse detection buffer (新架构)
+ *
+ * This function returns a pointer to the internal RMS window buffer containing
+ * the most recent 512 samples. This buffer can be directly used for FFT processing
+ * when coarse detection triggers, ensuring data synchronization.
+ *
+ * \param[out] buffer_size Pointer to store the buffer size (will be set to RMS_WINDOW_SIZE)
+ * \return Pointer to the buffer, or NULL if not initialized or window not full
+ */
+const float32_t* Coarse_Detector_GetBuffer(uint32_t* buffer_size);
+
+/**
  * \brief Reset coarse detection algorithm
  *
  * This function resets the coarse detection algorithm to initial state.
@@ -232,7 +244,7 @@ bool Coarse_Detector_IsWindowFull(void);
 #define FINE_DETECTION_MID_FREQ_THRESHOLD     0.2f    // 中频能量阈值
 #define FINE_DETECTION_DOMINANT_FREQ_MAX      50.0f   // 主频上限 (Hz)
 #define FINE_DETECTION_CENTROID_MAX           80.0f   // 频谱重心上限 (Hz)
-#define FINE_DETECTION_CONFIDENCE_THRESHOLD   0.7f    // 置信度阈值
+#define FINE_DETECTION_CONFIDENCE_THRESHOLD   0.85f   // 置信度阈值（提高到0.85以降低误报率）
 
 /* 分类结果定义 */
 typedef enum {
