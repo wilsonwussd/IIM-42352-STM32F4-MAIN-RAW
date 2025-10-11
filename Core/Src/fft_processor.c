@@ -23,7 +23,7 @@ extern uint32_t HAL_GetTick(void);
 #endif
 
 /* Debug control - set to 0 to reduce debug output */
-#define FFT_DEBUG_VERBOSE 1  // Set to 1 for detailed FFT debug output (临时启用调试)
+#define FFT_DEBUG_VERBOSE 0  // Set to 1 for detailed FFT debug output
 
 /* Private Variables */
 static fft_processor_t fft_processor;
