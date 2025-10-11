@@ -407,6 +407,11 @@ int main(void)
 	printf("\r\n");
 	LowPower_WOM_DumpRegisters();
 
+	/* 关键：清除在配置和dump期间可能产生的误触发 */
+	/* 因为NVIC在配置过程中就已经使能了，读取样本和dump寄存器时可能触发中断 */
+	LowPower_WOM_ClearTrigger();
+	printf("DEBUG: Cleared any false triggers during configuration\r\n");
+
 	HAL_Delay(500);  // 给一点时间输出
 
 	do {
@@ -429,6 +434,11 @@ int main(void)
 			if (wom_ret != 0) {
 				printf("LOW_POWER: ERROR - Failed to switch to LN mode: %d\r\n", wom_ret);
 			}
+
+			/* 关键：切换到LN模式后，重新使能NVIC以接收DATA_RDY中断 */
+			printf("LOW_POWER: Re-enabling INT1 interrupt for data collection...\r\n");
+			HAL_NVIC_ClearPendingIRQ(EXTI9_5_IRQn);
+			HAL_NVIC_EnableIRQ(EXTI9_5_IRQn);
 
 			/* 启动检测流程 */
 			LowPower_StartDetectionProcess();
@@ -456,12 +466,25 @@ int main(void)
 #endif
 
 			/* 运行现有的检测流程直到完成 */
+			static uint32_t loop_counter = 0;
+			loop_counter = 0;
+			printf("DEBUG: Entering detection loop...\r\n");
+
 			do {
+				loop_counter++;
+
+//				/* 每100次循环打印一次调试信息 */
+//				if (loop_counter % 100 == 0) {
+//					printf("DEBUG: Loop #%lu, irq_from_device=0x%02X\r\n", loop_counter, irq_from_device);
+//				}
+
 				/* 场景1优化：检查是否应该快速退出 */
 				if (LowPower_ShouldFastExit()) {
 					/* 粗检测未触发，快速退出，不再处理传感器FIFO */
 					/* 清空待处理的传感器中断标志 */
 					irq_from_device &= ~TO_MASK(INV_GPIO_INT1);
+
+					printf("DEBUG: Fast exit triggered at loop #%lu\r\n", loop_counter);
 
 					/* 在退出前打印检测完成统计（触发统计输出） */
 					LowPower_IsDetectionComplete();
@@ -471,6 +494,7 @@ int main(void)
 
 				/* Poll device for data */
 				if (irq_from_device & TO_MASK(INV_GPIO_INT1)) {
+				//	printf("DEBUG: Processing sensor data at loop #%lu\r\n", loop_counter);
 					rc = GetDataFromInvDevice();
 					check_rc(rc, "error while processing FIFO");
 					irq_from_device &= ~TO_MASK(INV_GPIO_INT1);
@@ -937,8 +961,18 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
 {
     if (GPIO_Pin == GPIO_PIN_7) { // PC7 - INT1 from sensor
 #if ENABLE_WOM_MODE
-        // WOM模式：调用WOM中断处理
-        LowPower_WOM_IRQHandler();
+        // WOM模式：需要区分两种情况
+        // 1. 如果g_wom_triggered=false，说明是WOM唤醒中断
+        // 2. 如果g_wom_triggered=true，说明是检测阶段的DATA_RDY中断
+        extern volatile bool g_wom_triggered;
+
+        if (!g_wom_triggered) {
+            // STOP模式下的WOM唤醒中断
+            LowPower_WOM_IRQHandler();
+        } else {
+            // 检测模式下的DATA_RDY中断
+            irq_from_device |= TO_MASK(INV_GPIO_INT1);
+        }
 #else
         // 正常模式：设置中断标志
         irq_from_device |= TO_MASK(INV_GPIO_INT1);

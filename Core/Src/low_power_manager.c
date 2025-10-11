@@ -24,11 +24,17 @@ static power_mode_t g_current_power_mode = POWER_MODE_CONTINUOUS;
 static bool g_low_power_initialized = false;
 
 /* WOM触发标志（由中断设置，由应用清除） */
-static volatile bool g_wom_triggered = false;
+/* 注意：不使用static，以便main.c可以访问来区分WOM中断和DATA_RDY中断 */
+volatile bool g_wom_triggered = false;
+static volatile uint32_t g_wom_isr_count = 0;  // ISR重入计数器
 
 /* 外部变量声明 */
 extern volatile uint32_t irq_from_device;
 extern struct inv_iim423xx icm_driver;
+
+/* 外部函数声明 */
+extern void SystemClock_Config(void);  // 系统时钟配置函数（STOP模式唤醒后需要重新配置）
+extern UART_HandleTypeDef huart1;      // 调试串口句柄
 
 /**
  * @brief 低功耗管理初始化
@@ -175,43 +181,117 @@ int LowPower_EnterSleep(void)
     inv_iim423xx_read_reg(&icm_driver, MPUREG_INT_STATUS2, 1, &int_status2);
     inv_iim423xx_read_reg(&icm_driver, MPUREG_INT_STATUS3, 1, &int_status3);
 
+    // 关键：如果INT_STATUS2有WOM标志，说明在进入STOP前就已经触发了
+    // 这种情况下应该立即处理，不进入STOP
+    if ((int_status2 & 0x07) != 0) {
+        printf("LOW_POWER: WOM triggered before entering STOP! (ST2=0x%02X)\r\n", int_status2);
+        printf("LOW_POWER: Will process WOM event instead of entering STOP\r\n");
+        g_wom_triggered = true;
+        g_low_power_manager.wom_trigger_count++;
+        g_low_power_manager.is_sleeping = false;
+        return 0;  // 不进入STOP，直接返回让main loop处理
+    }
+
     // 清除NVIC pending的中断
     HAL_NVIC_ClearPendingIRQ(EXTI9_5_IRQn);
+
+    // 清除可能的误触发标志
+    g_wom_triggered = false;
 
     if (g_low_power_manager.debug_enabled) {
         printf("LOW_POWER: Cleared pending interrupts before sleep (ST=0x%02X, ST2=0x%02X, ST3=0x%02X)\r\n",
                int_status, int_status2, int_status3);
     }
+
+    // 关键：先打印所有调试信息，再禁用SysTick
+    printf("LOW_POWER: Enabling WOM interrupt for wakeup...\r\n");
+    printf("LOW_POWER: System will enter STOP mode now...\r\n");
+
+    // 等待UART发送完成（在禁用SysTick之前）
+    HAL_Delay(100);  // 给足够时间让UART发送完成
 #endif
 
-    // 暂停SysTick中断以避免频繁唤醒
-    HAL_SuspendTick();
+    // 使能EXTI9_5中断，以便WOM触发时唤醒系统
+    HAL_NVIC_ClearPendingIRQ(EXTI9_5_IRQn);
+    HAL_NVIC_EnableIRQ(EXTI9_5_IRQn);
 
-#if ENABLE_WOM_MODE
-    // WOM模式：保持EXTI9_5中断使能，以便WOM触发时唤醒系统
-    // 不禁用EXTI9_5_IRQn！
-    if (g_low_power_manager.debug_enabled) {
-        printf("LOW_POWER: WOM mode - Keeping INT1 interrupt enabled for wakeup\r\n");
-        HAL_Delay(10);  // 确保打印完成
-    }
-#else
+    // 禁用SysTick定时器（STOP模式必须禁用）
+    // 注意：必须在所有HAL_Delay()之后禁用
+    CLEAR_BIT(SysTick->CTRL, SysTick_CTRL_ENABLE_Msk);
+
+#if !ENABLE_WOM_MODE
     // 非WOM模式：禁用传感器GPIO中断（PC7）
     HAL_NVIC_DisableIRQ(EXTI9_5_IRQn);
 #endif
 
-    // 进入Sleep模式
-    HAL_PWR_EnterSLEEPMode(PWR_MAINREGULATOR_ON, PWR_SLEEPENTRY_WFI);
+    // 进入STOP模式（低功耗稳压器，WFI指令）
+    // 相比SLEEP模式，STOP模式功耗更低，但唤醒后需要重新配置时钟
+    HAL_PWR_EnterSTOPMode(PWR_LOWPOWERREGULATOR_ON, PWR_STOPENTRY_WFI);
+
+    // ===== 从STOP模式唤醒后，代码从这里继续执行 =====
+
+    // 关键：重新配置系统时钟（STOP模式下HSE和PLL会关闭，唤醒后需要重新配置）
+    SystemClock_Config();
+
+    // 关键：重新初始化UART（STOP模式下UART时钟停止，可能导致状态异常）
+    // 必须在SystemClock_Config()之后，因为UART需要时钟
+    HAL_StatusTypeDef uart_status;
+    uart_status = HAL_UART_DeInit(&huart1);
+    uart_status = HAL_UART_Init(&huart1);
+
+    // 添加延时，确保UART完全初始化
+    HAL_Delay(100);
+
+    // 测试：直接发送字符，不使用printf
+    const char test_msg[] = "\r\n=== WAKEUP TEST ===\r\n";
+    HAL_UART_Transmit(&huart1, (uint8_t*)test_msg, sizeof(test_msg)-1, 1000);
 
 #if !ENABLE_WOM_MODE
     // 非WOM模式：恢复传感器GPIO中断
     HAL_NVIC_EnableIRQ(EXTI9_5_IRQn);
 #endif
 
-    // 恢复SysTick中断
-    HAL_ResumeTick();
+    // 重新使能SysTick定时器
+    SET_BIT(SysTick->CTRL, SysTick_CTRL_ENABLE_Msk);
 
     // 唤醒后执行
-    printf("\r\n*** WOKE UP FROM SLEEP ***\r\n");
+    printf("\r\n========================================\r\n");
+    printf("*** WOKE UP FROM STOP MODE ***\r\n");
+    printf("========================================\r\n");
+
+    // 验证并打印WOM触发信息（在ISR中无法打印和验证）
+    if (g_wom_triggered) {
+        // 现在时钟已恢复，读取传感器中断状态进行验证
+        uint8_t int_status, int_status2, int_status3;
+        inv_iim423xx_read_reg(&icm_driver, MPUREG_INT_STATUS, 1, &int_status);
+        inv_iim423xx_read_reg(&icm_driver, MPUREG_INT_STATUS2, 1, &int_status2);
+        inv_iim423xx_read_reg(&icm_driver, MPUREG_INT_STATUS3, 1, &int_status3);
+
+        printf("Sensor interrupt status: ST=0x%02X, ST2=0x%02X, ST3=0x%02X\r\n",
+               int_status, int_status2, int_status3);
+
+        // 验证是否真的是WOM触发（检查INT_STATUS2的WOM标志）
+        if ((int_status2 & 0x07) == 0) {
+            // 不是WOM触发，是误触发！
+            printf("*** FALSE WOM TRIGGER DETECTED! ***\r\n");
+            printf("INT_STATUS2 WOM flags are all 0, this is not a real WOM event\r\n");
+            g_low_power_manager.wom_false_alarm_count++;
+            g_wom_triggered = false;  // 清除标志
+            printf("False alarm count: %lu\r\n", g_low_power_manager.wom_false_alarm_count);
+        } else {
+            // 真正的WOM触发
+            printf("*** REAL WOM TRIGGER CONFIRMED! ***\r\n");
+            printf("WOM_X=%d, WOM_Y=%d, WOM_Z=%d\r\n",
+                   int_status2 & 0x01,
+                   (int_status2 >> 1) & 0x01,
+                   (int_status2 >> 2) & 0x01);
+            printf("WOM Trigger Count: %lu\r\n", g_low_power_manager.wom_trigger_count);
+            printf("WOM ISR Reentry Count: %lu\r\n", g_wom_isr_count);
+            printf("Last Trigger Time: %lu ms\r\n", g_low_power_manager.last_wom_trigger_time);
+        }
+    }
+    printf("========================================\r\n\r\n");
+
     g_low_power_manager.is_sleeping = false;
     uint32_t sleep_end_time = HAL_GetTick();
     uint32_t sleep_duration = sleep_end_time - sleep_start_time;
@@ -946,9 +1026,9 @@ int LowPower_WOM_Enable(void)
     // 清除GPIO pending中断
     HAL_NVIC_ClearPendingIRQ(EXTI9_5_IRQn);
 
-    // 使能NVIC中断
-    printf("WOM:   Enabling NVIC interrupt...\r\n");
-    HAL_NVIC_EnableIRQ(EXTI9_5_IRQn);
+    // 注意：不在这里使能NVIC，而是在进入STOP前才使能
+    // 这样可以避免配置期间的误触发
+    printf("WOM:   NVIC will be enabled before entering STOP mode\r\n");
 
     // ===== STEP 7: 验证最终配置 =====
     printf("WOM: STEP 7: Verifying final configuration...\r\n");
@@ -974,6 +1054,12 @@ int LowPower_WOM_Enable(void)
     printf("WOM:   INT_STATUS2 = 0x%02X (should be 0x00 after clearing)\r\n", int_status2);
 
     g_low_power_manager.is_lp_mode = true;
+
+    // 关键：清除可能在配置过程中产生的误触发标志
+    // 确保系统能正常进入STOP模式
+    g_wom_triggered = false;
+    g_wom_isr_count = 0;
+
     printf("WOM: WOM mode enabled successfully\r\n");
     printf("WOM: System ready to detect motion. Shake the sensor to trigger WOM!\r\n");
 
@@ -1061,11 +1147,22 @@ int LowPower_WOM_SwitchToLNMode(void)
         return -1;
     }
 
+    // 关键：使能DATA_RDY中断，以便在LN模式下接收数据
+    // 在WOM模式下，INT_SOURCE0被设置为0x00（禁用DATA_RDY）
+    // 现在需要重新使能DATA_RDY中断
+    uint8_t int_source0 = BIT_INT_SOURCE0_UI_DRDY_INT1_EN;
+    rc = inv_iim423xx_write_reg(&icm_driver, MPUREG_INT_SOURCE0, 1, &int_source0);
+    if (rc != 0) {
+        printf("WOM: ERROR - Failed to enable DATA_RDY interrupt: %d\r\n", rc);
+        return -2;
+    }
+    printf("WOM: Enabled DATA_RDY interrupt for LN mode\r\n");
+
     // 设置为LN模式，1000Hz
     rc = inv_iim423xx_set_accel_frequency(&icm_driver, IIM423XX_ACCEL_CONFIG0_ODR_1_KHZ);
     if (rc != 0) {
         printf("WOM: ERROR - Failed to set ODR to 1000Hz: %d\r\n", rc);
-        return -2;
+        return -3;
     }
 
     // 等待传感器启动（10ms）
@@ -1134,63 +1231,28 @@ void LowPower_WOM_ClearTrigger(void)
  */
 void LowPower_WOM_IRQHandler(void)
 {
-    static uint32_t total_irq_count = 0;
-    uint8_t int_status = 0;
-    uint8_t int_status2 = 0;
-    uint8_t int_status3 = 0;
-    int rc = 0;
-
-    total_irq_count++;
-
-    // 详细调试：打印每次中断
-    printf("\r\n[IRQ #%lu] WOM_IRQHandler called\r\n", total_irq_count);
-
-    // 读取所有中断状态寄存器
-    rc = inv_iim423xx_read_reg(&icm_driver, MPUREG_INT_STATUS, 1, &int_status);
-    if (rc != 0) {
-        printf("  ERROR - Failed to read INT_STATUS: %d\r\n", rc);
-        return;
+    // 防止重复处理：如果已经触发过且未清除，直接返回
+    if (g_wom_triggered) {
+        g_wom_isr_count++;
+        return;  // 静默返回
     }
 
-    rc = inv_iim423xx_read_reg(&icm_driver, MPUREG_INT_STATUS2, 1, &int_status2);
-    if (rc != 0) {
-        printf("  ERROR - Failed to read INT_STATUS2: %d\r\n", rc);
-        return;
-    }
+    // 关键：STOP模式下不能进行任何外设通信！
+    // - 不能使用printf（UART时钟停止）
+    // - 不能使用SPI通信（SPI时钟停止）
+    // - 只能设置标志，唤醒后再处理
 
-    rc = inv_iim423xx_read_reg(&icm_driver, MPUREG_INT_STATUS3, 1, &int_status3);
-    if (rc != 0) {
-        printf("  ERROR - Failed to read INT_STATUS3: %d\r\n", rc);
-        return;
-    }
-
-    // 打印所有中断状态
-    printf("  INT_STATUS:  0x%02X\r\n", int_status);
-    printf("  INT_STATUS2: 0x%02X (WOM_X=%d, WOM_Y=%d, WOM_Z=%d)\r\n",
-           int_status2,
-           int_status2 & 0x01,
-           (int_status2 >> 1) & 0x01,
-           (int_status2 >> 2) & 0x01);
-    printf("  INT_STATUS3: 0x%02X\r\n", int_status3);
-
-    // 验证WOM标志（Bit 0=X, Bit 1=Y, Bit 2=Z）
-    if ((int_status2 & 0x07) == 0) {
-        // 这是误触发（GPIO噪声或其他中断源）
-        g_low_power_manager.wom_false_alarm_count++;
-        printf("  Result: FALSE ALARM (no WOM bits set)\r\n");
-        printf("  False alarm count: %lu\r\n\r\n", g_low_power_manager.wom_false_alarm_count);
-        return;
-    }
-
-    // 真正的WOM中断
-    // 注意：只设置标志，不要在ISR中进行SPI通信！
+    // 设置WOM触发标志
     g_wom_triggered = true;
     g_low_power_manager.wom_trigger_count++;
+
+    // 注意：HAL_GetTick()可能不准确，因为SysTick已禁用
+    // 但是可以用来记录相对时间
     g_low_power_manager.last_wom_trigger_time = HAL_GetTick();
 
-    printf("  Result: *** WOM TRIGGERED! ***\r\n");
-    printf("  Trigger count: %lu\r\n", g_low_power_manager.wom_trigger_count);
-    printf("  Time: %lu ms\r\n\r\n", g_low_power_manager.last_wom_trigger_time);
+    // ISR返回后，CPU会从HAL_PWR_EnterSTOPMode()返回
+    // 然后执行SystemClock_Config()恢复时钟
+    // 最后在LowPower_ExitSleep()中打印调试信息
 }
 
 /**
