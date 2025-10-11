@@ -22,6 +22,9 @@ extern uint32_t HAL_GetTick(void);
 #define PI 3.14159265358979323846f
 #endif
 
+/* Debug control - set to 0 to reduce debug output */
+#define FFT_DEBUG_VERBOSE 0  // Set to 1 for detailed FFT debug output
+
 /* Private Variables */
 static fft_processor_t fft_processor;
 static bool is_initialized = false;
@@ -220,11 +223,39 @@ int FFT_ProcessBuffer(const float32_t* buffer, uint32_t buffer_size)
         printf("FFT_PROCESS_BUFFER: Applied Hanning window\r\n");
     }
 
+#if FFT_DEBUG_VERBOSE
+    // 调试：检查FFT输入数据（前5个复数对）
+    printf("FFT_DEBUG: Input before FFT (first 5 complex pairs):\r\n");
+    for (uint32_t i = 0; i < 5; i++) {
+        printf("  [%lu] Real=%.6f, Imag=%.6f\r\n", i,
+               fft_processor.fft_input[2*i], fft_processor.fft_input[2*i+1]);
+    }
+#endif
+
     // Perform FFT using CMSIS DSP
     arm_cfft_f32(&arm_cfft_sR_f32_len512, fft_processor.fft_input, 0, 1);
 
+#if FFT_DEBUG_VERBOSE
+    // 调试：检查FFT输出数据（前5个复数对）
+    printf("FFT_DEBUG: Output after FFT (first 5 complex pairs):\r\n");
+    for (uint32_t i = 0; i < 5; i++) {
+        printf("  [%lu] Real=%.6f, Imag=%.6f\r\n", i,
+               fft_processor.fft_input[2*i], fft_processor.fft_input[2*i+1]);
+    }
+#endif
+
     // Calculate magnitude spectrum
     arm_cmplx_mag_f32(fft_processor.fft_input, fft_processor.fft_output, FFT_SIZE);
+
+#if FFT_DEBUG_VERBOSE
+    // 调试：检查幅度谱（前10个值）
+    printf("FFT_DEBUG: Magnitude spectrum (first 10 bins):\r\n");
+    printf("  ");
+    for (uint32_t i = 0; i < 10; i++) {
+        printf("%.6f ", fft_processor.fft_output[i]);
+    }
+    printf("\r\n");
+#endif
 
     // Copy magnitude spectrum to result (257 points: 0 to Nyquist frequency)
     for (uint32_t i = 0; i < FFT_OUTPUT_POINTS; i++) {

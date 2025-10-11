@@ -32,6 +32,7 @@ extern "C" {
 #define ENABLE_WOM_MODE                 1       // 使能WOM模式（1=WOM触发，0=RTC定时）
 #define RTC_WAKEUP_PERIOD_SEC           2       // RTC唤醒周期(秒) - WOM模式下不使用
 #define LOW_POWER_DEBUG_ENABLED         1       // 低功耗调试使能
+#define LOW_POWER_DEBUG_VERBOSE         0       // 详细调试输出（0=简洁，1=详细）
 
 /* 功耗管理参数 */
 #define SLEEP_ENTRY_DELAY_MS            100     // 进入Sleep前延时

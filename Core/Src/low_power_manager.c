@@ -423,6 +423,54 @@ int LowPower_StartDetectionProcess(void)
         uint16_t fifo_count = (fifo_count_h << 8) | fifo_count_l;
         printf("LOW_POWER:   FIFO_COUNT = %d bytes\r\n", fifo_count);
 
+        // 如果FIFO有残留数据，清空它
+        if (fifo_count > 100 || fifo_count > 2048) {
+#if LOW_POWER_DEBUG_VERBOSE
+            printf("LOW_POWER: ⚠️ WARNING - FIFO has residual data (%d bytes), clearing...\r\n", fifo_count);
+#endif
+
+            // 方法1：FIFO_FLUSH
+            uint8_t reg_value = 0;
+            for (int i = 0; i < 3; i++) {
+                rc = inv_iim423xx_read_reg(&icm_driver, MPUREG_SIGNAL_PATH_RESET, 1, &reg_value);
+                if (rc == 0) {
+                    reg_value |= 0x04;  // FIFO_FLUSH bit
+                    inv_iim423xx_write_reg(&icm_driver, MPUREG_SIGNAL_PATH_RESET, 1, &reg_value);
+                    HAL_Delay(5);
+                }
+            }
+
+            // 方法2：读取并丢弃FIFO数据
+            uint8_t dummy_buffer[16];
+            int read_count = 0;
+            while (read_count < 100) {
+                inv_iim423xx_read_reg(&icm_driver, MPUREG_FIFO_COUNTH, 1, &fifo_count_h);
+                inv_iim423xx_read_reg(&icm_driver, MPUREG_FIFO_COUNTL, 1, &fifo_count_l);
+                fifo_count = (fifo_count_h << 8) | fifo_count_l;
+
+                if (fifo_count == 0 || fifo_count > 2048) {
+                    break;
+                }
+
+                inv_iim423xx_read_reg(&icm_driver, MPUREG_FIFO_DATA, 16, dummy_buffer);
+                read_count++;
+            }
+
+            // 验证清空结果
+            inv_iim423xx_read_reg(&icm_driver, MPUREG_FIFO_COUNTH, 1, &fifo_count_h);
+            inv_iim423xx_read_reg(&icm_driver, MPUREG_FIFO_COUNTL, 1, &fifo_count_l);
+            fifo_count = (fifo_count_h << 8) | fifo_count_l;
+
+#if LOW_POWER_DEBUG_VERBOSE
+            printf("LOW_POWER:   After clearing: FIFO_COUNT = %d bytes (read_count=%d)\r\n", fifo_count, read_count);
+#else
+            // 简洁模式：只在清空失败时输出
+            if (fifo_count > 100) {
+                printf("LOW_POWER: ⚠️ FIFO clear failed (count=%d)\r\n", fifo_count);
+            }
+#endif
+        }
+
         // 检查中断状态
         uint8_t int_status = 0;
         inv_iim423xx_read_reg(&icm_driver, MPUREG_INT_STATUS, 1, &int_status);
@@ -1336,8 +1384,10 @@ int LowPower_WOM_SwitchToLNMode(void)
         }
     }
 
-    // 等待传感器启动（20ms，LN模式需要更长时间）
-    HAL_Delay(20);
+    // 等待传感器启动（50ms，LN模式需要更长时间）
+    // IIM-42352数据手册：加速度计启动时间最大20ms
+    // 但实际测试发现需要更长时间才能稳定输出1000Hz
+    HAL_Delay(50);
 
     // 增强的FIFO清除逻辑（多次清除确保彻底）
     printf("WOM: Clearing FIFO for fresh start (enhanced)...\r\n");
@@ -1372,18 +1422,84 @@ int LowPower_WOM_SwitchToLNMode(void)
         HAL_Delay(5);
     }
 
-    // 读取并显示FIFO状态
+    // 读取并显示FIFO状态，如果异常则强制清空
     uint8_t fifo_count_h = 0, fifo_count_l = 0;
     inv_iim423xx_read_reg(&icm_driver, MPUREG_FIFO_COUNTH, 1, &fifo_count_h);
     inv_iim423xx_read_reg(&icm_driver, MPUREG_FIFO_COUNTL, 1, &fifo_count_l);
     uint16_t fifo_count = (fifo_count_h << 8) | fifo_count_l;
     printf("WOM:   FIFO_COUNT = %d bytes (should be 0 after flush)\r\n", fifo_count);
 
-    // 如果FIFO_COUNT仍然异常，警告但继续
-    if (fifo_count > 2048) {
-        printf("WOM: ⚠️ WARNING - FIFO_COUNT = %d > 2048 (FIFO overflow or read error)\r\n", fifo_count);
-        printf("WOM:   This may indicate FIFO overflow or SPI communication issue\r\n");
-        printf("WOM:   Continuing anyway, will monitor for errors...\r\n");
+    // 如果FIFO_COUNT仍然异常，强制清空FIFO
+    if (fifo_count > 2048 || fifo_count > 100) {
+#if LOW_POWER_DEBUG_VERBOSE
+        printf("WOM: ⚠️ WARNING - FIFO_COUNT = %d (abnormal, forcing clear)\r\n", fifo_count);
+#endif
+
+        // 方法1：禁用FIFO
+        uint8_t fifo_config = 0;
+        inv_iim423xx_read_reg(&icm_driver, MPUREG_FIFO_CONFIG, 1, &fifo_config);
+        uint8_t fifo_config_backup = fifo_config;
+        fifo_config &= ~0xC0;  // 禁用FIFO
+        inv_iim423xx_write_reg(&icm_driver, MPUREG_FIFO_CONFIG, 1, &fifo_config);
+        HAL_Delay(10);
+
+        // 方法2：多次FIFO_FLUSH
+        for (int i = 0; i < 5; i++) {
+            rc = inv_iim423xx_read_reg(&icm_driver, MPUREG_SIGNAL_PATH_RESET, 1, &reg_value);
+            if (rc == 0) {
+                reg_value |= 0x04;  // FIFO_FLUSH bit
+                inv_iim423xx_write_reg(&icm_driver, MPUREG_SIGNAL_PATH_RESET, 1, &reg_value);
+                HAL_Delay(10);
+            }
+        }
+
+        // 方法3：读取并丢弃所有FIFO数据
+        uint8_t dummy_buffer[16];
+        int read_count = 0;
+        while (read_count < 200) {  // 最多读取200次，避免死循环
+            inv_iim423xx_read_reg(&icm_driver, MPUREG_FIFO_COUNTH, 1, &fifo_count_h);
+            inv_iim423xx_read_reg(&icm_driver, MPUREG_FIFO_COUNTL, 1, &fifo_count_l);
+            fifo_count = (fifo_count_h << 8) | fifo_count_l;
+
+            if (fifo_count == 0 || fifo_count > 2048) {
+                break;  // FIFO已空或读取错误
+            }
+
+            // 读取并丢弃16字节
+            inv_iim423xx_read_reg(&icm_driver, MPUREG_FIFO_DATA, 16, dummy_buffer);
+            read_count++;
+        }
+
+        // 重新使能FIFO
+        inv_iim423xx_write_reg(&icm_driver, MPUREG_FIFO_CONFIG, 1, &fifo_config_backup);
+        HAL_Delay(10);
+
+        // 最后一次FIFO_FLUSH
+        rc = inv_iim423xx_read_reg(&icm_driver, MPUREG_SIGNAL_PATH_RESET, 1, &reg_value);
+        if (rc == 0) {
+            reg_value |= 0x04;  // FIFO_FLUSH bit
+            inv_iim423xx_write_reg(&icm_driver, MPUREG_SIGNAL_PATH_RESET, 1, &reg_value);
+            HAL_Delay(10);
+        }
+
+        // 验证FIFO是否清空
+        inv_iim423xx_read_reg(&icm_driver, MPUREG_FIFO_COUNTH, 1, &fifo_count_h);
+        inv_iim423xx_read_reg(&icm_driver, MPUREG_FIFO_COUNTL, 1, &fifo_count_l);
+        fifo_count = (fifo_count_h << 8) | fifo_count_l;
+
+#if LOW_POWER_DEBUG_VERBOSE
+        printf("WOM:   After forced clear: FIFO_COUNT = %d bytes (read_count=%d)\r\n", fifo_count, read_count);
+
+        if (fifo_count > 100) {
+            printf("WOM: ⚠️ ERROR - Failed to clear FIFO after multiple attempts!\r\n");
+            printf("WOM:   This may indicate hardware issue or SPI communication problem\r\n");
+        }
+#else
+        // 简洁模式：只在FIFO清空失败时输出警告
+        if (fifo_count > 100) {
+            printf("WOM: ⚠️ FIFO clear failed (count=%d), continuing anyway\r\n", fifo_count);
+        }
+#endif
     }
 
     // 清除所有中断状态
