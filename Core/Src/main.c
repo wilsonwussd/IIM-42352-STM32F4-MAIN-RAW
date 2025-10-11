@@ -478,6 +478,13 @@ int main(void)
 //					printf("DEBUG: Loop #%lu, irq_from_device=0x%02X\r\n", loop_counter, irq_from_device);
 //				}
 
+				/* 检查是否应该退出检测循环（完成或超时） */
+				if (LowPower_ShouldExitDetection()) {
+					/* 清空待处理的传感器中断标志 */
+					irq_from_device &= ~TO_MASK(INV_GPIO_INT1);
+					break;  /* 退出检测循环 */
+				}
+
 				/* 场景1优化：检查是否应该快速退出 */
 				if (LowPower_ShouldFastExit()) {
 					/* 粗检测未触发，快速退出，不再处理传感器FIFO */
@@ -533,7 +540,7 @@ int main(void)
 				/* 短暂延时避免CPU占用过高 */
 				HAL_Delay(1);
 
-			} while (!LowPower_IsDetectionComplete());
+			} while (1);  /* 循环由LowPower_ShouldExitDetection()控制退出 */
 
 			/* 检测完成，打印统计信息 */
 			if (LOW_POWER_DEBUG_ENABLED) {

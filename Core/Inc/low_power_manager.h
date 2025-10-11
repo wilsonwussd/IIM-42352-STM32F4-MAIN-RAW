@@ -37,11 +37,12 @@ extern "C" {
 #define SLEEP_ENTRY_DELAY_MS            100     // 进入Sleep前延时
 #define WAKEUP_STABILIZE_DELAY_MS       50      // 唤醒后稳定延时
 #define SENSOR_STARTUP_DELAY_MS         10      // 传感器启动延时
+#define DETECTION_TIMEOUT_MS            5000    // 检测超时时间（5秒）
 
 /* WOM配置参数（参考IIM-42352数据手册Section 8.7） */
-#define WOM_THRESHOLD_X                 2       // X轴WOM阈值 (LSB, 2 * 3.9mg ≈ 8mg)
-#define WOM_THRESHOLD_Y                 2       // Y轴WOM阈值 (LSB, 2 * 3.9mg ≈ 8mg)
-#define WOM_THRESHOLD_Z                 2       // Z轴WOM阈值 (LSB, 2 * 3.9mg ≈ 8mg)
+#define WOM_THRESHOLD_X                 8       // X轴WOM阈值 (LSB, 8 * 3.9mg ≈ 31mg)
+#define WOM_THRESHOLD_Y                 8       // Y轴WOM阈值 (LSB, 8 * 3.9mg ≈ 31mg)
+#define WOM_THRESHOLD_Z                 8       // Z轴WOM阈值 (LSB, 8 * 3.9mg ≈ 31mg)
 #define WOM_MODE                        1       // WOM模式: 0=与初始值比较, 1=与前一个值比较
 #define WOM_INT_MODE                    0       // WOM中断模式: 0=OR(任一轴), 1=AND(所有轴)
 #define GUARD_ACCEL_ODR                 50      // LP模式加速度计ODR (Hz)
@@ -143,6 +144,18 @@ int LowPower_StartDetectionProcess(void);
  * @return true: 检测完成, false: 检测进行中
  */
 bool LowPower_IsDetectionComplete(void);
+
+/**
+ * @brief 检查检测是否超时
+ * @return true: 超时, false: 未超时
+ */
+bool LowPower_IsDetectionTimeout(void);
+
+/**
+ * @brief 检查是否应该退出检测循环（完成或超时）
+ * @return true: 应该退出, false: 继续检测
+ */
+bool LowPower_ShouldExitDetection(void);
 
 /**
  * @brief 检查是否应该快速退出（场景1优化）

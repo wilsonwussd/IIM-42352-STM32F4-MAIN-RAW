@@ -520,6 +520,71 @@ bool LowPower_IsDetectionComplete(void)
 }
 
 /**
+ * @brief 检查检测是否超时
+ */
+bool LowPower_IsDetectionTimeout(void)
+{
+    if (!g_low_power_initialized) {
+        return false;
+    }
+
+    // 如果检测未开始，不算超时
+    if (g_low_power_manager.detection_start_time == 0) {
+        return false;
+    }
+
+    // 计算已经过的时间
+    uint32_t elapsed_ms = HAL_GetTick() - g_low_power_manager.detection_start_time;
+
+    // 检查是否超时
+    if (elapsed_ms > DETECTION_TIMEOUT_MS) {
+        if (g_low_power_manager.debug_enabled) {
+            printf("LOW_POWER: ⚠️ Detection timeout! Elapsed: %lu ms (limit: %d ms)\r\n",
+                   elapsed_ms, DETECTION_TIMEOUT_MS);
+            printf("LOW_POWER: Forcing detection completion and returning to sleep mode\r\n");
+        }
+
+        // 更新统计
+        g_low_power_manager.detection_end_time = HAL_GetTick();
+        g_low_power_manager.total_active_time_ms += elapsed_ms;
+        g_low_power_manager.detection_start_time = 0;  // 重置检测开始时间
+
+        return true;
+    }
+
+    return false;
+}
+
+/**
+ * @brief 检查是否应该退出检测循环（完成或超时）
+ */
+bool LowPower_ShouldExitDetection(void)
+{
+    if (!g_low_power_initialized) {
+        return true;
+    }
+
+    // 检查超时（优先级最高）
+    if (LowPower_IsDetectionTimeout()) {
+        if (g_low_power_manager.debug_enabled) {
+            printf("LOW_POWER: Exiting detection due to TIMEOUT\r\n");
+        }
+        return true;
+    }
+
+    // 检查检测完成
+    if (LowPower_IsDetectionComplete()) {
+        if (g_low_power_manager.debug_enabled) {
+            printf("LOW_POWER: Exiting detection due to COMPLETION\r\n");
+        }
+        return true;
+    }
+
+    // 继续检测
+    return false;
+}
+
+/**
  * @brief 检查是否应该快速退出（场景1优化）
  *
  * 当粗检测未触发时，不需要继续处理传感器FIFO中的剩余数据
