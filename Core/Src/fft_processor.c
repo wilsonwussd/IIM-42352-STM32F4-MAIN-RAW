@@ -171,6 +171,8 @@ int FFT_ProcessBuffer(const float32_t* buffer, uint32_t buffer_size)
     }
 
     printf("FFT_PROCESS_BUFFER: Starting FFT processing from external buffer...\r\n");
+    printf("FFT_PROCESS_BUFFER: window_enabled=%d, window_computed=%d\r\n",
+           fft_processor.window_enabled, window_computed);
     fft_processor.state = FFT_STATE_PROCESSING;
 
     // Debug: Calculate RMS of input data
@@ -217,6 +219,14 @@ int FFT_ProcessBuffer(const float32_t* buffer, uint32_t buffer_size)
 
     // Apply windowing if enabled
     if (fft_processor.window_enabled) {
+#if FFT_DEBUG_VERBOSE
+        // 调试：检查Hanning窗口值
+        printf("FFT_DEBUG: Hanning window (first 10 values): ");
+        for (uint32_t i = 0; i < 10; i++) {
+            printf("%.6f ", hanning_window[i]);
+        }
+        printf("\r\n");
+#endif
         for (uint32_t i = 0; i < FFT_SIZE; i++) {
             fft_processor.fft_input[2*i] *= hanning_window[i];
         }
