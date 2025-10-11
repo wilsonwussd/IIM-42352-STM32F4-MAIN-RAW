@@ -174,6 +174,8 @@ int FFT_ProcessBuffer(const float32_t* buffer, uint32_t buffer_size)
     float32_t sum_squares = 0.0f;
     float32_t max_val = 0.0f;
     float32_t min_val = 0.0f;
+    uint32_t zero_count = 0;
+    uint32_t large_count = 0;  // 大于1g的样本数
 
     // Copy buffer to FFT input and calculate statistics
     for (uint32_t i = 0; i < FFT_SIZE; i++) {
@@ -185,11 +187,30 @@ int FFT_ProcessBuffer(const float32_t* buffer, uint32_t buffer_size)
         sum_squares += sample * sample;
         if (i == 0 || sample > max_val) max_val = sample;
         if (i == 0 || sample < min_val) min_val = sample;
+
+        // 统计零值和大值
+        if (sample == 0.0f) zero_count++;
+        if (fabsf(sample) > 1.0f) large_count++;
     }
 
     float32_t input_rms = sqrtf(sum_squares / FFT_SIZE);
-    printf("FFT_PROCESS_BUFFER: Input RMS=%.6f, Max=%.6f, Min=%.6f, Range=%.6f\r\n",
+    printf("FFT_INPUT_STATS: RMS=%.6f, Max=%.6f, Min=%.6f, Range=%.6f\r\n",
            input_rms, max_val, min_val, max_val - min_val);
+    printf("FFT_INPUT_QUALITY: Zero_samples=%lu, Large_samples=%lu (>1g)\r\n",
+           zero_count, large_count);
+
+    // 输出前10个和后10个样本用于验证数据连续性
+    printf("FFT_INPUT_FIRST10: ");
+    for (uint32_t i = 0; i < 10; i++) {
+        printf("%.4f ", buffer[i]);
+    }
+    printf("\r\n");
+
+    printf("FFT_INPUT_LAST10: ");
+    for (uint32_t i = FFT_SIZE - 10; i < FFT_SIZE; i++) {
+        printf("%.4f ", buffer[i]);
+    }
+    printf("\r\n");
 
     // Apply windowing if enabled
     if (fft_processor.window_enabled) {
@@ -250,6 +271,20 @@ int FFT_ProcessBuffer(const float32_t* buffer, uint32_t buffer_size)
            fft_processor.last_result.dominant_frequency,
            fft_processor.last_result.dominant_magnitude,
            fft_processor.last_result.total_energy);
+
+    // 输出前20个频率bin的幅值（0-39 Hz，每bin 1.953Hz）
+    printf("FFT_SPECTRUM_0-39Hz: ");
+    for (uint32_t i = 0; i < 20; i++) {
+        printf("%.6f ", fft_processor.last_result.magnitude_spectrum[i]);
+    }
+    printf("\r\n");
+
+    // 输出频率bin对应的频率值
+    printf("FFT_FREQ_BINS_0-39Hz: ");
+    for (uint32_t i = 0; i < 20; i++) {
+        printf("%.2f ", fft_processor.last_result.frequency_bins[i]);
+    }
+    printf("\r\n");
 
     return 0;
 }

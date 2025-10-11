@@ -340,6 +340,16 @@ void HandleInvDeviceFifoPacket(inv_iim423xx_sensor_event_t * event)
 			if (coarse_buffer != NULL && buffer_size == FFT_SIZE) {
 				printf("NEW_ARCH: Got coarse buffer with %lu samples, processing FFT...\r\n", buffer_size);
 
+				// 验证粗检测缓冲区的RMS与粗检测计算的RMS是否一致
+				float32_t verify_sum_squares = 0.0f;
+				for (uint32_t i = 0; i < buffer_size; i++) {
+					verify_sum_squares += coarse_buffer[i] * coarse_buffer[i];
+				}
+				float32_t verify_rms = sqrtf(verify_sum_squares / buffer_size);
+				printf("NEW_ARCH_VERIFY: Coarse RMS=%.6f, Buffer RMS=%.6f, Match=%s\r\n",
+				       coarse_detector.current_rms, verify_rms,
+				       (fabsf(coarse_detector.current_rms - verify_rms) < 0.001f) ? "YES" : "NO");
+
 				// 直接使用粗检测缓冲区进行FFT处理
 				int fft_result = FFT_ProcessBuffer(coarse_buffer, buffer_size);
 
@@ -584,15 +594,29 @@ int Coarse_Detector_Process(float32_t filtered_sample)
     // 计算当前RMS (仅在窗口满后)
     if (coarse_detector.window_full) {
         float32_t sum_squares = 0.0f;
+        float32_t max_val = -1000.0f;
+        float32_t min_val = 1000.0f;
+
         for (int i = 0; i < RMS_WINDOW_SIZE; i++) {
             // 计算RMS时再平方
             float32_t sample = coarse_detector.rms_window[i];
             sum_squares += sample * sample;
+
+            // 统计最大最小值
+            if (sample > max_val) max_val = sample;
+            if (sample < min_val) min_val = sample;
         }
         coarse_detector.current_rms = sqrtf(sum_squares / RMS_WINDOW_SIZE);
 
         // 计算峰值因子
         coarse_detector.peak_factor = coarse_detector.current_rms / coarse_detector.baseline_rms;
+
+        // 详细调试输出（每512个样本输出一次）
+        if (debug_counter % 512 == 0) {
+            printf("COARSE_STATS: RMS=%.6f, Max=%.6f, Min=%.6f, Range=%.6f, Peak_Factor=%.2f\r\n",
+                   coarse_detector.current_rms, max_val, min_val, max_val - min_val,
+                   coarse_detector.peak_factor);
+        }
 
         // 每512个样本输出一次调试信息（窗口满一次）
         if (debug_counter % 512 == 0) {
@@ -676,8 +700,36 @@ const float32_t* Coarse_Detector_GetBuffer(uint32_t* buffer_size)
         *buffer_size = RMS_WINDOW_SIZE;
     }
 
-    printf("COARSE_BUFFER: Returning buffer with %d samples\r\n", RMS_WINDOW_SIZE);
-    return coarse_detector.rms_window;
+    // 重新排列循环缓冲区数据为时间顺序
+    // 当前window_index指向最新数据的下一个位置（即最老数据的位置）
+    // 需要重新排列：[window_index, window_index+1, ..., 511, 0, 1, ..., window_index-1]
+    // 这样ordered_buffer[0]是最老的数据，ordered_buffer[511]是最新的数据
+
+    uint32_t src_index = coarse_detector.window_index;  // 最老数据的位置
+
+    for (uint32_t i = 0; i < RMS_WINDOW_SIZE; i++) {
+        coarse_detector.ordered_buffer[i] = coarse_detector.rms_window[src_index];
+        src_index = (src_index + 1) % RMS_WINDOW_SIZE;
+    }
+
+    printf("COARSE_BUFFER: Reordered buffer with %d samples (oldest at index %lu)\r\n",
+           RMS_WINDOW_SIZE, coarse_detector.window_index);
+
+    // 调试：输出前5个和后5个样本
+    printf("COARSE_BUFFER: First 5 samples: %.6f, %.6f, %.6f, %.6f, %.6f\r\n",
+           coarse_detector.ordered_buffer[0],
+           coarse_detector.ordered_buffer[1],
+           coarse_detector.ordered_buffer[2],
+           coarse_detector.ordered_buffer[3],
+           coarse_detector.ordered_buffer[4]);
+    printf("COARSE_BUFFER: Last 5 samples: %.6f, %.6f, %.6f, %.6f, %.6f\r\n",
+           coarse_detector.ordered_buffer[RMS_WINDOW_SIZE-5],
+           coarse_detector.ordered_buffer[RMS_WINDOW_SIZE-4],
+           coarse_detector.ordered_buffer[RMS_WINDOW_SIZE-3],
+           coarse_detector.ordered_buffer[RMS_WINDOW_SIZE-2],
+           coarse_detector.ordered_buffer[RMS_WINDOW_SIZE-1]);
+
+    return coarse_detector.ordered_buffer;
 }
 #endif
 
@@ -701,9 +753,9 @@ static float32_t calculate_frequency_bin_energy(const float32_t* magnitude_spect
     // FFT配置：采样频率1000Hz，FFT大小512，频率分辨率1.953125Hz
     const float32_t freq_resolution = 1000.0f / 512.0f;  // 1.953125 Hz
 
-    // 计算频段对应的bin索引
-    uint32_t bin_min = (uint32_t)(freq_min / freq_resolution);
-    uint32_t bin_max = (uint32_t)(freq_max / freq_resolution);
+    // 计算频段对应的bin索引（向上取整，确保不包含低于freq_min的频率）
+    uint32_t bin_min = (uint32_t)((freq_min / freq_resolution) + 0.5f);  // 向上取整
+    uint32_t bin_max = (uint32_t)((freq_max / freq_resolution) + 0.5f);  // 向上取整
 
     // 限制在有效范围内
     if (bin_min >= spectrum_length) bin_min = spectrum_length - 1;
@@ -715,6 +767,9 @@ static float32_t calculate_frequency_bin_energy(const float32_t* magnitude_spect
     for (uint32_t i = bin_min; i <= bin_max; i++) {
         energy += magnitude_spectrum[i] * magnitude_spectrum[i];
     }
+
+    printf("FREQ_BIN_ENERGY_DEBUG: freq_range=[%.2f-%.2f]Hz, bin_range=[%lu-%lu], energy=%.6f\r\n",
+           freq_min, freq_max, bin_min, bin_max, energy);
 
     return energy;
 }
@@ -855,17 +910,25 @@ int Fine_Detector_Process(const float32_t* magnitude_spectrum,
 
     // 详细调试输出
     printf("FINE_DETECTION_DEBUG: ===== Feature Analysis =====\r\n");
-    printf("  Low Freq Energy (5-15Hz):  %.6f (threshold: %.2f)\r\n",
-           features->low_freq_energy, FINE_DETECTION_LOW_FREQ_THRESHOLD);
-    printf("  Mid Freq Energy (15-30Hz): %.6f (threshold: %.2f)\r\n",
-           features->mid_freq_energy, FINE_DETECTION_MID_FREQ_THRESHOLD);
-    printf("  High Freq Energy (30-100Hz): %.6f\r\n", features->high_freq_energy);
+    printf("  Total Energy (5-500Hz): %.6f\r\n", total_energy);
+    printf("  Low Freq Energy (5-15Hz):  %.6f (%.2f%%, threshold: %.2f)\r\n",
+           features->low_freq_energy, features->low_freq_energy * 100.0f,
+           FINE_DETECTION_LOW_FREQ_THRESHOLD);
+    printf("  Mid Freq Energy (15-30Hz): %.6f (%.2f%%, threshold: %.2f)\r\n",
+           features->mid_freq_energy, features->mid_freq_energy * 100.0f,
+           FINE_DETECTION_MID_FREQ_THRESHOLD);
+    printf("  High Freq Energy (30-100Hz): %.6f (%.2f%%)\r\n",
+           features->high_freq_energy, features->high_freq_energy * 100.0f);
     printf("  Dominant Frequency: %.2f Hz (max: %.2f Hz)\r\n",
            features->dominant_frequency, FINE_DETECTION_DOMINANT_FREQ_MAX);
     printf("  Spectral Centroid: %.2f Hz (max: %.2f Hz)\r\n",
            features->spectral_centroid, FINE_DETECTION_CENTROID_MAX);
     printf("  Confidence Score: %.4f (threshold: %.2f)\r\n",
            features->confidence_score, FINE_DETECTION_CONFIDENCE_THRESHOLD);
+
+    // 能量分布验证
+    float32_t energy_sum = features->low_freq_energy + features->mid_freq_energy + features->high_freq_energy;
+    printf("  Energy Distribution Check: Low+Mid+High = %.6f (should be <= 1.0)\r\n", energy_sum);
 
     // 分类决策：添加主频过滤，排除低频噪音
     // 如果主频 < 5Hz，很可能是2Hz噪音，直接判定为正常振动

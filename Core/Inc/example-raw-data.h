@@ -62,7 +62,8 @@ typedef enum {
 
 /* 粗检测算法状态结构 */
 typedef struct {
-    float32_t rms_window[RMS_WINDOW_SIZE];  // RMS滑动窗口缓冲区
+    float32_t rms_window[RMS_WINDOW_SIZE];  // RMS滑动窗口缓冲区（循环）
+    float32_t ordered_buffer[RMS_WINDOW_SIZE]; // 时间顺序缓冲区（用于FFT）
     uint32_t window_index;                  // 窗口索引
     bool window_full;                       // 窗口是否已满
 
