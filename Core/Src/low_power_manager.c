@@ -1339,13 +1339,37 @@ int LowPower_WOM_SwitchToLNMode(void)
     // 等待传感器启动（20ms，LN模式需要更长时间）
     HAL_Delay(20);
 
-    // 清除FIFO，确保从干净状态开始
-    printf("WOM: Clearing FIFO for fresh start...\r\n");
+    // 增强的FIFO清除逻辑（多次清除确保彻底）
+    printf("WOM: Clearing FIFO for fresh start (enhanced)...\r\n");
+
+    // 第1次清除：使用FIFO_FLUSH
     rc = inv_iim423xx_read_reg(&icm_driver, MPUREG_SIGNAL_PATH_RESET, 1, &reg_value);
     if (rc == 0) {
         reg_value |= 0x04;  // FIFO_FLUSH bit
         inv_iim423xx_write_reg(&icm_driver, MPUREG_SIGNAL_PATH_RESET, 1, &reg_value);
-        HAL_Delay(2);  // 等待FIFO清除完成
+        HAL_Delay(5);  // 等待FIFO清除完成
+    }
+
+    // 第2次清除：禁用并重新使能FIFO（如果FIFO被使用）
+    uint8_t fifo_config = 0;
+    rc = inv_iim423xx_read_reg(&icm_driver, MPUREG_FIFO_CONFIG, 1, &fifo_config);
+    if (rc == 0 && (fifo_config & 0xC0) != 0) {
+        // FIFO被使能，先禁用再重新使能
+        printf("WOM:   FIFO is enabled, resetting...\r\n");
+        uint8_t fifo_config_backup = fifo_config;
+        fifo_config &= ~0xC0;  // 禁用FIFO
+        inv_iim423xx_write_reg(&icm_driver, MPUREG_FIFO_CONFIG, 1, &fifo_config);
+        HAL_Delay(2);
+        inv_iim423xx_write_reg(&icm_driver, MPUREG_FIFO_CONFIG, 1, &fifo_config_backup);
+        HAL_Delay(2);
+    }
+
+    // 第3次清除：再次FIFO_FLUSH
+    rc = inv_iim423xx_read_reg(&icm_driver, MPUREG_SIGNAL_PATH_RESET, 1, &reg_value);
+    if (rc == 0) {
+        reg_value |= 0x04;  // FIFO_FLUSH bit
+        inv_iim423xx_write_reg(&icm_driver, MPUREG_SIGNAL_PATH_RESET, 1, &reg_value);
+        HAL_Delay(5);
     }
 
     // 读取并显示FIFO状态
@@ -1355,10 +1379,17 @@ int LowPower_WOM_SwitchToLNMode(void)
     uint16_t fifo_count = (fifo_count_h << 8) | fifo_count_l;
     printf("WOM:   FIFO_COUNT = %d bytes (should be 0 after flush)\r\n", fifo_count);
 
-    // 读取中断状态
+    // 如果FIFO_COUNT仍然异常，警告但继续
+    if (fifo_count > 2048) {
+        printf("WOM: ⚠️ WARNING - FIFO_COUNT = %d > 2048 (FIFO overflow or read error)\r\n", fifo_count);
+        printf("WOM:   This may indicate FIFO overflow or SPI communication issue\r\n");
+        printf("WOM:   Continuing anyway, will monitor for errors...\r\n");
+    }
+
+    // 清除所有中断状态
     uint8_t int_status = 0;
     inv_iim423xx_read_reg(&icm_driver, MPUREG_INT_STATUS, 1, &int_status);
-    printf("WOM:   INT_STATUS = 0x%02X\r\n", int_status);
+    printf("WOM:   INT_STATUS = 0x%02X (cleared by reading)\r\n", int_status);
 
     g_low_power_manager.is_lp_mode = false;
 

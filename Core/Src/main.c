@@ -176,6 +176,9 @@ int inv_io_hal_write_reg(struct inv_iim423xx_serif * serif, uint8_t reg, const u
 /* Flag set from iim423xx device irq handler */
 volatile uint32_t irq_from_device;
 
+/* External reference to icm_driver for FIFO error recovery */
+extern struct inv_iim423xx icm_driver;
+
 
 #define TO_MASK(a) (1U << (unsigned)(a))
 enum gpio_inv_pin_num {
@@ -816,13 +819,38 @@ static void MX_UART5_Init(void)
 
 
 /*
- * Helper function to check RC value and block programm exectution
+ * Helper function to check RC value and handle FIFO errors
  */
 static void check_rc(int rc, const char * msg_context)
 {
 	if(rc < 0) {
 		INV_MSG(INV_MSG_LEVEL_ERROR, "%s: error %d (%s)\r\n", msg_context, rc, inv_error_str(rc));
 		printf("WARNING: Continuing despite error in %s\r\n", msg_context);
+
+		// 如果是FIFO处理错误，尝试恢复
+		if (rc == INV_ERROR && strstr(msg_context, "FIFO") != NULL) {
+			static uint32_t fifo_error_count = 0;
+			fifo_error_count++;
+
+			printf("FIFO_ERROR: Error count = %lu, attempting recovery...\r\n", fifo_error_count);
+
+			// 恢复策略：重置FIFO
+			uint8_t reg_value = 0;
+			int reset_rc = inv_iim423xx_read_reg(&icm_driver, MPUREG_SIGNAL_PATH_RESET, 1, &reg_value);
+			if (reset_rc == 0) {
+				reg_value |= 0x04;  // FIFO_FLUSH bit
+				inv_iim423xx_write_reg(&icm_driver, MPUREG_SIGNAL_PATH_RESET, 1, &reg_value);
+				HAL_Delay(5);
+				printf("FIFO_ERROR: FIFO reset completed\r\n");
+			}
+
+			// 如果错误次数过多，警告用户
+			if (fifo_error_count > 10) {
+				printf("FIFO_ERROR: ⚠️ WARNING - Too many FIFO errors (%lu), sensor may be unstable\r\n", fifo_error_count);
+				fifo_error_count = 0;  // 重置计数器
+			}
+		}
+
 		// while(1);  // 注释掉无限循环，允许程序继续执行
 	}
 }
