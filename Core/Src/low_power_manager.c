@@ -378,6 +378,59 @@ int LowPower_StartDetectionProcess(void)
     // 传感器启动延时
     HAL_Delay(SENSOR_STARTUP_DELAY_MS);
 
+    // 验证传感器状态
+    if (g_low_power_manager.debug_enabled) {
+        printf("LOW_POWER: === SENSOR STATUS CHECK ===\r\n");
+
+        uint8_t reg_value = 0;
+        int rc = 0;
+
+        // 检查PWR_MGMT_0
+        rc = inv_iim423xx_read_reg(&icm_driver, MPUREG_PWR_MGMT_0, 1, &reg_value);
+        if (rc == 0) {
+            uint8_t accel_mode = (reg_value >> 0) & 0x03;
+            printf("LOW_POWER:   PWR_MGMT_0 = 0x%02X (ACCEL_MODE=%d, expected 3 for LN)\r\n",
+                   reg_value, accel_mode);
+            if (accel_mode != 3) {
+                printf("LOW_POWER: ⚠️ WARNING - Sensor not in LN mode!\r\n");
+            }
+        }
+
+        // 检查ACCEL_CONFIG0
+        rc = inv_iim423xx_read_reg(&icm_driver, MPUREG_ACCEL_CONFIG0, 1, &reg_value);
+        if (rc == 0) {
+            uint8_t odr = (reg_value >> 0) & 0x0F;
+            printf("LOW_POWER:   ACCEL_CONFIG0 = 0x%02X (ODR=0x%02X, expected 0x06 for 1000Hz)\r\n",
+                   reg_value, odr);
+            if (odr != 0x06) {
+                printf("LOW_POWER: ⚠️ WARNING - ODR not set to 1000Hz!\r\n");
+            }
+        }
+
+        // 检查INT_SOURCE0
+        rc = inv_iim423xx_read_reg(&icm_driver, MPUREG_INT_SOURCE0, 1, &reg_value);
+        if (rc == 0) {
+            printf("LOW_POWER:   INT_SOURCE0 = 0x%02X (expected 0x08 for DATA_RDY)\r\n", reg_value);
+            if ((reg_value & BIT_INT_SOURCE0_UI_DRDY_INT1_EN) == 0) {
+                printf("LOW_POWER: ⚠️ WARNING - DATA_RDY interrupt not enabled!\r\n");
+            }
+        }
+
+        // 检查FIFO状态
+        uint8_t fifo_count_h = 0, fifo_count_l = 0;
+        inv_iim423xx_read_reg(&icm_driver, MPUREG_FIFO_COUNTH, 1, &fifo_count_h);
+        inv_iim423xx_read_reg(&icm_driver, MPUREG_FIFO_COUNTL, 1, &fifo_count_l);
+        uint16_t fifo_count = (fifo_count_h << 8) | fifo_count_l;
+        printf("LOW_POWER:   FIFO_COUNT = %d bytes\r\n", fifo_count);
+
+        // 检查中断状态
+        uint8_t int_status = 0;
+        inv_iim423xx_read_reg(&icm_driver, MPUREG_INT_STATUS, 1, &int_status);
+        printf("LOW_POWER:   INT_STATUS = 0x%02X\r\n", int_status);
+
+        printf("LOW_POWER: === SENSOR STATUS CHECK COMPLETE ===\r\n");
+    }
+
     // 重置快速退出标志
     g_low_power_manager.fast_exit_enabled = 0;
 
@@ -1078,9 +1131,23 @@ int LowPower_WOM_Enable(void)
         printf("WOM:   Cleared INT_STATUS: 0x%02X\r\n", int_status);
     }
 
+    // 清除INT_STATUS2（WOM状态）- 多次读取确保清除
+    for (int i = 0; i < 3; i++) {
+        inv_iim423xx_read_reg(&icm_driver, MPUREG_INT_STATUS2, 1, &int_status2);
+        if (i == 0 && int_status2 != 0) {
+            printf("WOM:   Cleared INT_STATUS2: 0x%02X\r\n", int_status2);
+        }
+        if (int_status2 == 0x00) {
+            break;  // 已清除
+        }
+        HAL_Delay(1);  // 短暂延时后重试
+    }
+
+    // 验证INT_STATUS2是否真的被清除
     inv_iim423xx_read_reg(&icm_driver, MPUREG_INT_STATUS2, 1, &int_status2);
-    if (int_status2 != 0) {
-        printf("WOM:   Cleared INT_STATUS2: 0x%02X\r\n", int_status2);
+    if (int_status2 != 0x00) {
+        printf("WOM: ⚠️ WARNING - INT_STATUS2 still = 0x%02X after clearing!\r\n", int_status2);
+        printf("WOM: This may cause immediate re-trigger after entering STOP mode\r\n");
     }
 
     inv_iim423xx_read_reg(&icm_driver, MPUREG_INT_STATUS3, 1, &int_status3);
@@ -1200,6 +1267,7 @@ int LowPower_WOM_Disable(void)
 int LowPower_WOM_SwitchToLNMode(void)
 {
     int rc = 0;
+    uint8_t reg_value = 0;
 
     if (g_low_power_manager.debug_enabled) {
         printf("WOM: Switching to LN mode (1000Hz)...\r\n");
@@ -1212,31 +1280,91 @@ int LowPower_WOM_SwitchToLNMode(void)
         return -1;
     }
 
-    // 关键：使能DATA_RDY中断，以便在LN模式下接收数据
-    // 在WOM模式下，INT_SOURCE0被设置为0x00（禁用DATA_RDY）
-    // 现在需要重新使能DATA_RDY中断
+    // 关键步骤1：先使能LN模式（Low Noise Mode）
+    printf("WOM: Enabling Low Noise (LN) mode...\r\n");
+    rc = inv_iim423xx_enable_accel_low_noise_mode(&icm_driver);
+    if (rc != 0) {
+        printf("WOM: ERROR - Failed to enable LN mode: %d\r\n", rc);
+        return -2;
+    }
+    HAL_Delay(10);  // 等待模式切换
+
+    // 验证ACCEL_MODE是否为3（LN模式）
+    rc = inv_iim423xx_read_reg(&icm_driver, MPUREG_PWR_MGMT_0, 1, &reg_value);
+    if (rc == 0) {
+        uint8_t accel_mode = (reg_value >> 0) & 0x03;
+        printf("WOM:   PWR_MGMT_0 = 0x%02X (ACCEL_MODE=%d)\r\n", reg_value, accel_mode);
+        if (accel_mode != 3) {
+            printf("WOM: ERROR - Failed to switch to LN mode! ACCEL_MODE=%d (expected 3)\r\n", accel_mode);
+            return -3;
+        }
+    }
+
+    // 关键步骤2：设置ODR为1000Hz
+    printf("WOM: Setting ODR to 1000Hz...\r\n");
+    rc = inv_iim423xx_set_accel_frequency(&icm_driver, IIM423XX_ACCEL_CONFIG0_ODR_1_KHZ);
+    if (rc != 0) {
+        printf("WOM: ERROR - Failed to set ODR to 1000Hz: %d\r\n", rc);
+        return -4;
+    }
+
+    // 关键步骤3：使能DATA_RDY中断
+    printf("WOM: Configuring DATA_RDY interrupt for LN mode...\r\n");
     uint8_t int_source0 = BIT_INT_SOURCE0_UI_DRDY_INT1_EN;
     rc = inv_iim423xx_write_reg(&icm_driver, MPUREG_INT_SOURCE0, 1, &int_source0);
     if (rc != 0) {
         printf("WOM: ERROR - Failed to enable DATA_RDY interrupt: %d\r\n", rc);
-        return -2;
-    }
-    printf("WOM: Enabled DATA_RDY interrupt for LN mode\r\n");
-
-    // 设置为LN模式，1000Hz
-    rc = inv_iim423xx_set_accel_frequency(&icm_driver, IIM423XX_ACCEL_CONFIG0_ODR_1_KHZ);
-    if (rc != 0) {
-        printf("WOM: ERROR - Failed to set ODR to 1000Hz: %d\r\n", rc);
-        return -3;
+        return -5;
     }
 
-    // 等待传感器启动（10ms）
-    HAL_Delay(10);
+    // 验证INT_SOURCE0配置
+    rc = inv_iim423xx_read_reg(&icm_driver, MPUREG_INT_SOURCE0, 1, &reg_value);
+    if (rc == 0) {
+        printf("WOM:   INT_SOURCE0 = 0x%02X (expected: 0x08)\r\n", reg_value);
+        if (reg_value != BIT_INT_SOURCE0_UI_DRDY_INT1_EN) {
+            printf("WOM: WARNING - INT_SOURCE0 verification failed!\r\n");
+        }
+    }
+
+    // 验证ACCEL_CONFIG0
+    rc = inv_iim423xx_read_reg(&icm_driver, MPUREG_ACCEL_CONFIG0, 1, &reg_value);
+    if (rc == 0) {
+        printf("WOM:   ACCEL_CONFIG0 = 0x%02X (ODR should be 0x06 for 1000Hz)\r\n", reg_value);
+        uint8_t odr = (reg_value >> 0) & 0x0F;
+        if (odr != 0x06) {
+            printf("WOM: WARNING - ODR = 0x%02X (expected: 0x06 for 1000Hz)\r\n", odr);
+        }
+    }
+
+    // 等待传感器启动（20ms，LN模式需要更长时间）
+    HAL_Delay(20);
+
+    // 清除FIFO，确保从干净状态开始
+    printf("WOM: Clearing FIFO for fresh start...\r\n");
+    rc = inv_iim423xx_read_reg(&icm_driver, MPUREG_SIGNAL_PATH_RESET, 1, &reg_value);
+    if (rc == 0) {
+        reg_value |= 0x04;  // FIFO_FLUSH bit
+        inv_iim423xx_write_reg(&icm_driver, MPUREG_SIGNAL_PATH_RESET, 1, &reg_value);
+        HAL_Delay(2);  // 等待FIFO清除完成
+    }
+
+    // 读取并显示FIFO状态
+    uint8_t fifo_count_h = 0, fifo_count_l = 0;
+    inv_iim423xx_read_reg(&icm_driver, MPUREG_FIFO_COUNTH, 1, &fifo_count_h);
+    inv_iim423xx_read_reg(&icm_driver, MPUREG_FIFO_COUNTL, 1, &fifo_count_l);
+    uint16_t fifo_count = (fifo_count_h << 8) | fifo_count_l;
+    printf("WOM:   FIFO_COUNT = %d bytes (should be 0 after flush)\r\n", fifo_count);
+
+    // 读取中断状态
+    uint8_t int_status = 0;
+    inv_iim423xx_read_reg(&icm_driver, MPUREG_INT_STATUS, 1, &int_status);
+    printf("WOM:   INT_STATUS = 0x%02X\r\n", int_status);
 
     g_low_power_manager.is_lp_mode = false;
 
     if (g_low_power_manager.debug_enabled) {
         printf("WOM: Switched to LN mode successfully\r\n");
+        printf("WOM: System ready to collect data at 1000Hz\r\n");
     }
 
     return 0;

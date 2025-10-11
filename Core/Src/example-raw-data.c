@@ -825,19 +825,19 @@ static float32_t calculate_spectral_centroid(const float32_t* magnitude_spectrum
 
 static float32_t calculate_confidence_score(const fine_detection_features_t* features)
 {
-    // 规则权重
-    const float32_t w_low = 0.4f;    // 低频能量权重
-    const float32_t w_mid = 0.2f;    // 中频能量权重
-    const float32_t w_dom = 0.2f;    // 主频权重
-    const float32_t w_cent = 0.2f;   // 频谱重心权重
+    // 规则权重（调整以适应真实震动特征）
+    const float32_t w_low = 0.5f;    // 低频能量权重（提高，因为挖掘震动主要在低频）
+    const float32_t w_mid = 0.2f;    // 中频能量权重（保持）
+    const float32_t w_dom = 0.2f;    // 主频权重（保持）
+    const float32_t w_cent = 0.1f;   // 频谱重心权重（降低）
 
     // 计算各项得分 (0-1范围)
     float32_t low_freq_score = (features->low_freq_energy > FINE_DETECTION_LOW_FREQ_THRESHOLD) ?
                                (features->low_freq_energy / FINE_DETECTION_LOW_FREQ_THRESHOLD) : 0.0f;
     if (low_freq_score > 1.0f) low_freq_score = 1.0f;
 
-    float32_t mid_freq_score = 1.0f - fabsf(features->mid_freq_energy - FINE_DETECTION_MID_FREQ_THRESHOLD) / FINE_DETECTION_MID_FREQ_THRESHOLD;
-    if (mid_freq_score < 0.0f) mid_freq_score = 0.0f;
+    // 中频能量得分：只要超过阈值就给满分
+    float32_t mid_freq_score = (features->mid_freq_energy >= FINE_DETECTION_MID_FREQ_THRESHOLD) ? 1.0f : 0.0f;
 
     float32_t dominant_freq_score = (features->dominant_frequency < FINE_DETECTION_DOMINANT_FREQ_MAX) ?
                                    (FINE_DETECTION_DOMINANT_FREQ_MAX - features->dominant_frequency) / FINE_DETECTION_DOMINANT_FREQ_MAX : 0.0f;

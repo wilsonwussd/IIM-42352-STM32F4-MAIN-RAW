@@ -236,10 +236,7 @@ int FFT_ProcessBuffer(const float32_t* buffer, uint32_t buffer_size)
             normalized_magnitude *= 2.0f;
         }
 
-        // 3. 传感器特性缩放
-        normalized_magnitude *= 0.001f;
-
-        // 4. 存储结果
+        // 3. 存储结果（不再进行额外缩放，保持原始幅度）
         fft_processor.last_result.magnitude_spectrum[i] = normalized_magnitude;
     }
 

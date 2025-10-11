@@ -468,15 +468,32 @@ int main(void)
 			/* 运行现有的检测流程直到完成 */
 			static uint32_t loop_counter = 0;
 			loop_counter = 0;
+			uint32_t data_process_count = 0;
+			uint32_t last_debug_time = HAL_GetTick();
 			printf("DEBUG: Entering detection loop...\r\n");
 
 			do {
 				loop_counter++;
 
-//				/* 每100次循环打印一次调试信息 */
-//				if (loop_counter % 100 == 0) {
-//					printf("DEBUG: Loop #%lu, irq_from_device=0x%02X\r\n", loop_counter, irq_from_device);
-//				}
+				/* 每1秒打印一次调试信息 */
+				uint32_t current_time = HAL_GetTick();
+				if (current_time - last_debug_time >= 1000) {
+					printf("DEBUG: Loop #%lu, irq_from_device=0x%02X, data_processed=%lu\r\n",
+					       loop_counter, irq_from_device, data_process_count);
+					last_debug_time = current_time;
+
+					// 如果1秒内没有处理任何数据，说明传感器可能有问题
+					if (data_process_count == 0) {
+						printf("DEBUG: ⚠️ WARNING - No data processed in last 1 second!\r\n");
+						printf("DEBUG: This indicates sensor may not be generating DATA_RDY interrupts\r\n");
+
+						// 检查GPIO中断引脚状态
+						GPIO_PinState pin_state = HAL_GPIO_ReadPin(GPIOC, GPIO_PIN_7);
+						printf("DEBUG:   INT1 Pin State = %d (0=LOW, 1=HIGH)\r\n", pin_state);
+					}
+
+					data_process_count = 0;  // 重置计数器
+				}
 
 				/* 检查是否应该退出检测循环（完成或超时） */
 				if (LowPower_ShouldExitDetection()) {
@@ -501,6 +518,7 @@ int main(void)
 
 				/* Poll device for data */
 				if (irq_from_device & TO_MASK(INV_GPIO_INT1)) {
+					data_process_count++;  // 增加数据处理计数
 				//	printf("DEBUG: Processing sensor data at loop #%lu\r\n", loop_counter);
 					rc = GetDataFromInvDevice();
 					check_rc(rc, "error while processing FIFO");
@@ -966,6 +984,9 @@ void HAL_GPIO_EXTI_Rising_Callback(uint16_t GPIO_Pin)
 }	
 void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
 {
+    static uint32_t data_rdy_count = 0;
+    static uint32_t last_data_rdy_time = 0;
+
     if (GPIO_Pin == GPIO_PIN_7) { // PC7 - INT1 from sensor
 #if ENABLE_WOM_MODE
         // WOM模式：需要区分两种情况
@@ -979,6 +1000,21 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
         } else {
             // 检测模式下的DATA_RDY中断
             irq_from_device |= TO_MASK(INV_GPIO_INT1);
+
+            // 调试：统计DATA_RDY中断频率
+            data_rdy_count++;
+            uint32_t current_time = HAL_GetTick();
+            if (data_rdy_count == 1) {
+                // 第一个DATA_RDY中断
+                last_data_rdy_time = current_time;
+                // printf("IRQ: First DATA_RDY interrupt received\r\n");
+            } else if (data_rdy_count == 100) {
+                // 每100个中断打印一次频率
+                uint32_t elapsed = current_time - last_data_rdy_time;
+                float freq = 100000.0f / elapsed;  // Hz
+                printf("IRQ: DATA_RDY frequency = %.1f Hz (expected: 1000 Hz)\r\n", freq);
+                data_rdy_count = 0;
+            }
         }
 #else
         // 正常模式：设置中断标志
