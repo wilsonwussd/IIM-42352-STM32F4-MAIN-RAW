@@ -490,6 +490,12 @@ int LowPower_StartDetectionProcess(void)
     if (g_low_power_manager.debug_enabled) {
         printf("LOW_POWER: Coarse detector window reset for fresh data collection\r\n");
     }
+
+    // 关键优化：等待额外100ms，让传感器输出完全稳定
+    // 这样可以避免前面的DC漂移数据进入粗检测窗口
+    printf("LOW_POWER: Waiting additional 100ms for sensor output to stabilize...\r\n");
+    HAL_Delay(100);
+    printf("LOW_POWER: Sensor should be stable now, starting data collection\r\n");
 #endif
 
     // 注意：这里不直接调用现有的检测函数，而是让主循环继续运行现有的检测逻辑
@@ -1384,10 +1390,13 @@ int LowPower_WOM_SwitchToLNMode(void)
         }
     }
 
-    // 等待传感器启动（50ms，LN模式需要更长时间）
+    // 等待传感器启动并稳定（200ms，确保DC偏移完全消除）
     // IIM-42352数据手册：加速度计启动时间最大20ms
-    // 但实际测试发现需要更长时间才能稳定输出1000Hz
-    HAL_Delay(50);
+    // 但从LP模式切换到LN模式后，需要更长时间让DC偏移稳定
+    // 实际测试发现：前200-300ms的数据有缓慢的DC漂移（<1Hz）
+    // 这会导致高通滤波器（5Hz截止）去除所有信号，FFT输出全0
+    printf("WOM: Waiting 200ms for sensor to stabilize after LP->LN transition...\r\n");
+    HAL_Delay(200);
 
     // 增强的FIFO清除逻辑（多次清除确保彻底）
     printf("WOM: Clearing FIFO for fresh start (enhanced)...\r\n");
