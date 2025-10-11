@@ -300,6 +300,14 @@ int main(void)
 	SetupMCUHardware(&iim423xx_serif);
 
   /* USER CODE END 2 */
+
+#if ENABLE_WOM_MODE
+	/* WOM模式：在传感器初始化前禁用INT1中断防止误触发 */
+	printf("MAIN: Pre-sensor-init - Disabling INT1 interrupt...\r\n");
+	HAL_NVIC_DisableIRQ(EXTI9_5_IRQn);
+	HAL_NVIC_ClearPendingIRQ(EXTI9_5_IRQn);
+#endif
+
 	/* Initialize Iim423xx */
 	rc = SetupInvDevice(&iim423xx_serif);
 	check_rc(rc, "error while setting up INV device");
@@ -373,8 +381,59 @@ int main(void)
 	/* 显示三种场景说明 */
 	LowPower_PrintScenarios();
 
-	/* 给串口输出时间，然后启动RTC */
+	/* 给串口输出时间 */
 	HAL_Delay(1000);
+
+#if ENABLE_WOM_MODE
+	/* WOM模式：配置并使能WOM */
+	printf("LOW_POWER: Configuring WOM mode...\r\n");
+
+	/* 配置WOM阈值 */
+	int wom_ret = LowPower_WOM_Configure(WOM_THRESHOLD_X, WOM_THRESHOLD_Y, WOM_THRESHOLD_Z);
+	if (wom_ret != 0) {
+		printf("LOW_POWER: ERROR - Failed to configure WOM: %d\r\n", wom_ret);
+		while(1);
+	}
+
+	/* 使能WOM模式 */
+	wom_ret = LowPower_WOM_Enable();
+	if (wom_ret != 0) {
+		printf("LOW_POWER: ERROR - Failed to enable WOM: %d\r\n", wom_ret);
+		while(1);
+	}
+	printf("LOW_POWER: WOM mode enabled successfully\r\n");
+
+	/* 打印所有WOM相关寄存器用于调试 */
+	printf("\r\n");
+	LowPower_WOM_DumpRegisters();
+
+	HAL_Delay(500);  // 给一点时间输出
+
+	do {
+		/* 检查是否有WOM触发事件 */
+		bool wom_triggered = LowPower_WOM_IsTriggered();
+		printf("DEBUG: Checking WOM trigger status: %d\r\n", wom_triggered);
+
+		if (wom_triggered) {
+			printf("LOW_POWER: WOM triggered! Starting detection...\r\n");
+
+			/* 清除WOM触发标志 */
+			LowPower_WOM_ClearTrigger();
+
+			/* 立即禁用WOM中断，防止连续触发 */
+			printf("LOW_POWER: Disabling WOM interrupts during detection...\r\n");
+			HAL_NVIC_DisableIRQ(EXTI9_5_IRQn);
+
+			/* 切换到LN模式进行检测 */
+			wom_ret = LowPower_WOM_SwitchToLNMode();
+			if (wom_ret != 0) {
+				printf("LOW_POWER: ERROR - Failed to switch to LN mode: %d\r\n", wom_ret);
+			}
+
+			/* 启动检测流程 */
+			LowPower_StartDetectionProcess();
+#else
+	/* RTC模式：启动RTC唤醒定时器 */
 	printf("LOW_POWER: Starting RTC wakeup timer...\r\n");
 
 	/* 启动RTC唤醒定时器 */
@@ -394,6 +453,7 @@ int main(void)
 
 			/* 启动检测流程 */
 			LowPower_StartDetectionProcess();
+#endif
 
 			/* 运行现有的检测流程直到完成 */
 			do {
@@ -459,10 +519,26 @@ int main(void)
 					LowPower_PrintStats();
 				}
 			}
+
+#if ENABLE_WOM_MODE
+			/* WOM模式：切换回LP+WOM模式 */
+			printf("LOW_POWER: Detection complete, switching back to LP+WOM mode...\r\n");
+			wom_ret = LowPower_WOM_SwitchToLPMode();
+			if (wom_ret != 0) {
+				printf("LOW_POWER: ERROR - Failed to switch to LP+WOM mode: %d\r\n", wom_ret);
+			}
+
+			/* 重新使能WOM中断 */
+			printf("LOW_POWER: Re-enabling WOM interrupts...\r\n");
+			HAL_NVIC_ClearPendingIRQ(EXTI9_5_IRQn);
+			HAL_NVIC_EnableIRQ(EXTI9_5_IRQn);
+#endif
 		}
 
 		/* 进入Sleep模式等待下次唤醒 */
 		LowPower_EnterSleep();
+
+		printf("DEBUG: Returned from LowPower_EnterSleep()\r\n");
 
 	} while(1);
 
@@ -859,8 +935,14 @@ void HAL_GPIO_EXTI_Rising_Callback(uint16_t GPIO_Pin)
 }	
 void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
 {
-    if (GPIO_Pin == GPIO_PIN_7) { // PC7 - ???????
+    if (GPIO_Pin == GPIO_PIN_7) { // PC7 - INT1 from sensor
+#if ENABLE_WOM_MODE
+        // WOM模式：调用WOM中断处理
+        LowPower_WOM_IRQHandler();
+#else
+        // 正常模式：设置中断标志
         irq_from_device |= TO_MASK(INV_GPIO_INT1);
+#endif
     }
 }
 

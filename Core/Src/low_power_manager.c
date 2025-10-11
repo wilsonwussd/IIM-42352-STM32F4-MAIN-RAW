@@ -13,6 +13,8 @@
 #include "rtc_wakeup.h"
 #include "main.h"
 #include "example-raw-data.h"
+#include "Iim423xxDefs.h"
+#include "Iim423xxDriver_HL.h"
 #include <stdio.h>
 #include <string.h>
 
@@ -21,8 +23,12 @@ static low_power_manager_t g_low_power_manager;
 static power_mode_t g_current_power_mode = POWER_MODE_CONTINUOUS;
 static bool g_low_power_initialized = false;
 
+/* WOM触发标志（由中断设置，由应用清除） */
+static volatile bool g_wom_triggered = false;
+
 /* 外部变量声明 */
 extern volatile uint32_t irq_from_device;
+extern struct inv_iim423xx icm_driver;
 
 /**
  * @brief 低功耗管理初始化
@@ -30,40 +36,98 @@ extern volatile uint32_t irq_from_device;
 int LowPower_Init(void)
 {
     printf("LOW_POWER: Initializing low power manager...\r\n");
-    
+
     // 清零管理结构体
     memset(&g_low_power_manager, 0, sizeof(low_power_manager_t));
-    
+
     // 初始化配置参数
     g_low_power_manager.wakeup_period_sec = RTC_WAKEUP_PERIOD_SEC;
     g_low_power_manager.debug_enabled = LOW_POWER_DEBUG_ENABLED;
     g_low_power_manager.low_power_enabled = ENABLE_LOW_POWER_MODE;
-    
+    g_low_power_manager.wom_enabled = ENABLE_WOM_MODE;
+
+    // 初始化WOM配置参数
+    g_low_power_manager.wom_threshold_x = WOM_THRESHOLD_X;
+    g_low_power_manager.wom_threshold_y = WOM_THRESHOLD_Y;
+    g_low_power_manager.wom_threshold_z = WOM_THRESHOLD_Z;
+    g_low_power_manager.wom_mode = WOM_MODE;
+    g_low_power_manager.wom_int_mode = WOM_INT_MODE;
+
     // 初始化状态
     g_low_power_manager.is_sleeping = false;
+    g_low_power_manager.is_lp_mode = false;
     g_low_power_manager.current_state = LOW_POWER_STATE_ACTIVE;
     g_low_power_manager.wakeup_source = WAKEUP_SOURCE_NONE;
     g_low_power_manager.last_wakeup_time = HAL_GetTick();
-    
-    // 初始化RTC唤醒功能
+    g_wom_triggered = false;
+
+#if ENABLE_WOM_MODE
+    printf("LOW_POWER: WOM mode enabled\r\n");
+    printf("LOW_POWER: WOM thresholds: X=%d (%.1f mg), Y=%d (%.1f mg), Z=%d (%.1f mg)\r\n",
+           g_low_power_manager.wom_threshold_x, g_low_power_manager.wom_threshold_x * 3.9f,
+           g_low_power_manager.wom_threshold_y, g_low_power_manager.wom_threshold_y * 3.9f,
+           g_low_power_manager.wom_threshold_z, g_low_power_manager.wom_threshold_z * 3.9f);
+    printf("LOW_POWER: WOM mode: %s\r\n", g_low_power_manager.wom_mode ? "Compare with previous" : "Compare with initial");
+    printf("LOW_POWER: WOM INT mode: %s\r\n", g_low_power_manager.wom_int_mode ? "AND" : "OR");
+
+    // 禁用INT1中断防止初始化期间的误触发
+    printf("LOW_POWER: Disabling INT1 interrupt during initialization...\r\n");
+    HAL_NVIC_DisableIRQ(EXTI9_5_IRQn);
+    HAL_NVIC_ClearPendingIRQ(EXTI9_5_IRQn);
+
+    // 禁用传感器中的所有中断源（关键！）
+    printf("LOW_POWER: Disabling ALL interrupt sources in sensor...\r\n");
+    int ret = inv_iim423xx_set_reg_bank(&icm_driver, 0);
+
+    // 禁用INT_SOURCE0（DATA_RDY等）
+    uint8_t int_source0 = 0x00;
+    ret |= inv_iim423xx_write_reg(&icm_driver, MPUREG_INT_SOURCE0, 1, &int_source0);
+
+    // 禁用INT_SOURCE1（WOM等）
+    uint8_t int_source1 = 0x00;
+    ret |= inv_iim423xx_write_reg(&icm_driver, MPUREG_INT_SOURCE1, 1, &int_source1);
+
+    // 禁用WOM模式
+    uint8_t smd_config = 0;
+    ret |= inv_iim423xx_read_reg(&icm_driver, MPUREG_SMD_CONFIG, 1, &smd_config);
+    smd_config &= ~BIT_SMD_CONFIG_SMD_MODE_MASK;  // 设置为disabled (0)
+    ret |= inv_iim423xx_write_reg(&icm_driver, MPUREG_SMD_CONFIG, 1, &smd_config);
+
+    if (ret != 0) {
+        printf("LOW_POWER: ERROR - Failed to disable interrupts: %d\r\n", ret);
+        return -1;
+    }
+    printf("LOW_POWER: All interrupt sources disabled\r\n");
+
+    // 清除任何pending的中断状态
+    uint8_t int_status;
+    inv_iim423xx_read_reg(&icm_driver, MPUREG_INT_STATUS, 1, &int_status);
+    inv_iim423xx_read_reg(&icm_driver, MPUREG_INT_STATUS2, 1, &int_status);
+    inv_iim423xx_read_reg(&icm_driver, MPUREG_INT_STATUS3, 1, &int_status);
+    HAL_NVIC_ClearPendingIRQ(EXTI9_5_IRQn);
+    printf("LOW_POWER: Cleared all interrupt status registers\r\n");
+#else
+    // 初始化RTC唤醒功能（仅在非WOM模式下）
     int ret = RTC_Wakeup_Init();
     if (ret != 0) {
         printf("LOW_POWER: ERROR - Failed to initialize RTC wakeup: %d\r\n", ret);
         return -1;
     }
-    
+
     // 配置RTC唤醒周期
     ret = RTC_Wakeup_Configure(g_low_power_manager.wakeup_period_sec);
     if (ret != 0) {
         printf("LOW_POWER: ERROR - Failed to configure RTC wakeup: %d\r\n", ret);
         return -2;
     }
-    
+    printf("LOW_POWER: RTC wakeup mode enabled\r\n");
+    printf("LOW_POWER: Wakeup period: %lu seconds\r\n", g_low_power_manager.wakeup_period_sec);
+#endif
+
     g_low_power_initialized = true;
     printf("LOW_POWER: Low power manager initialized successfully\r\n");
-    printf("LOW_POWER: Wakeup period: %lu seconds\r\n", g_low_power_manager.wakeup_period_sec);
     printf("LOW_POWER: Debug enabled: %s\r\n", g_low_power_manager.debug_enabled ? "YES" : "NO");
-    
+
     return 0;
 }
 
@@ -104,22 +168,50 @@ int LowPower_EnterSleep(void)
         HAL_Delay(10);
     }
 
+#if ENABLE_WOM_MODE
+    // WOM模式：清除所有pending的传感器中断状态
+    uint8_t int_status, int_status2, int_status3;
+    inv_iim423xx_read_reg(&icm_driver, MPUREG_INT_STATUS, 1, &int_status);
+    inv_iim423xx_read_reg(&icm_driver, MPUREG_INT_STATUS2, 1, &int_status2);
+    inv_iim423xx_read_reg(&icm_driver, MPUREG_INT_STATUS3, 1, &int_status3);
+
+    // 清除NVIC pending的中断
+    HAL_NVIC_ClearPendingIRQ(EXTI9_5_IRQn);
+
+    if (g_low_power_manager.debug_enabled) {
+        printf("LOW_POWER: Cleared pending interrupts before sleep (ST=0x%02X, ST2=0x%02X, ST3=0x%02X)\r\n",
+               int_status, int_status2, int_status3);
+    }
+#endif
+
     // 暂停SysTick中断以避免频繁唤醒
     HAL_SuspendTick();
 
-    // 暂时禁用传感器GPIO中断（PC7）
+#if ENABLE_WOM_MODE
+    // WOM模式：保持EXTI9_5中断使能，以便WOM触发时唤醒系统
+    // 不禁用EXTI9_5_IRQn！
+    if (g_low_power_manager.debug_enabled) {
+        printf("LOW_POWER: WOM mode - Keeping INT1 interrupt enabled for wakeup\r\n");
+        HAL_Delay(10);  // 确保打印完成
+    }
+#else
+    // 非WOM模式：禁用传感器GPIO中断（PC7）
     HAL_NVIC_DisableIRQ(EXTI9_5_IRQn);
+#endif
 
     // 进入Sleep模式
     HAL_PWR_EnterSLEEPMode(PWR_MAINREGULATOR_ON, PWR_SLEEPENTRY_WFI);
 
-    // 恢复传感器GPIO中断
+#if !ENABLE_WOM_MODE
+    // 非WOM模式：恢复传感器GPIO中断
     HAL_NVIC_EnableIRQ(EXTI9_5_IRQn);
+#endif
 
     // 恢复SysTick中断
     HAL_ResumeTick();
 
     // 唤醒后执行
+    printf("\r\n*** WOKE UP FROM SLEEP ***\r\n");
     g_low_power_manager.is_sleeping = false;
     uint32_t sleep_end_time = HAL_GetTick();
     uint32_t sleep_duration = sleep_end_time - sleep_start_time;
@@ -257,36 +349,39 @@ bool LowPower_IsDetectionComplete(void)
         return false;
     }
 
+    // 声明detection_complete变量（在所有分支之前）
+    bool detection_complete = false;
+
     // 窗口已满，检查粗检测状态
     coarse_detection_state_t coarse_state = Coarse_Detector_GetState();
     if (coarse_state == COARSE_STATE_IDLE) {
         // 粗检测未触发，立即完成（场景1：无振动）
         // 设置快速退出标志，通知主循环停止处理传感器数据
         g_low_power_manager.fast_exit_enabled = 1;
-        bool detection_complete = true;
-        goto detection_done;  // 跳转到统计部分
-    }
-
-    // 粗检测已触发，需要等待完整的检测流程完成
-    g_low_power_manager.fast_exit_enabled = 0;
-#endif
+        detection_complete = true;
+    } else {
+        // 粗检测已触发，需要等待完整的检测流程完成
+        g_low_power_manager.fast_exit_enabled = 0;
 
 #if ENABLE_SYSTEM_STATE_MACHINE
-    // 获取系统状态机状态
-    system_state_t current_state = System_State_Machine_GetCurrentState();
-    // 只有在MONITORING或ALARM_COMPLETE状态时才认为检测完成
-    // 如果在COARSE_TRIGGERED、FINE_ANALYSIS、MINING_DETECTED、ALARM_SENDING等状态，需要继续处理
-    bool state_machine_idle = (current_state == STATE_MONITORING ||
-                              current_state == STATE_IDLE_SLEEP ||
-                              current_state == STATE_ALARM_COMPLETE);
+        // 获取系统状态机状态
+        system_state_t current_state = System_State_Machine_GetCurrentState();
+        // 只有在MONITORING或ALARM_COMPLETE状态时才认为检测完成
+        // 如果在COARSE_TRIGGERED、FINE_ANALYSIS、MINING_DETECTED、ALARM_SENDING等状态，需要继续处理
+        bool state_machine_idle = (current_state == STATE_MONITORING ||
+                                  current_state == STATE_IDLE_SLEEP ||
+                                  current_state == STATE_ALARM_COMPLETE);
 
-    bool detection_complete = state_machine_idle;
+        detection_complete = state_machine_idle;
 #else
-    // 如果状态机未启用，窗口满且粗检测未触发就完成
+        // 如果状态机未启用，窗口满且粗检测触发后也认为完成
+        detection_complete = true;
+#endif
+    }
+#else
+    // 如果粗检测未启用，直接认为完成
     bool detection_complete = true;
 #endif
-
-detection_done:
     
     if (detection_complete && g_low_power_manager.detection_start_time > 0) {
         // 更新检测结束时间和统计
@@ -517,10 +612,42 @@ int LowPower_ProcessMainLoop(void)
         return 0;
     }
 
-    // 检查是否有RTC唤醒事件
+#if ENABLE_WOM_MODE
+    // WOM模式：检查WOM触发事件
+    if (LowPower_WOM_IsTriggered()) {
+        if (g_low_power_manager.debug_enabled) {
+            printf("LOW_POWER: Processing WOM wakeup event\r\n");
+        }
+
+        // 更新唤醒统计
+        g_low_power_manager.wakeup_count++;
+        g_low_power_manager.last_wakeup_time = HAL_GetTick();
+        g_low_power_manager.wakeup_source = WAKEUP_SOURCE_WOM;
+
+        // 清除WOM触发标志
+        LowPower_WOM_ClearTrigger();
+
+        // 切换到LN模式进行检测
+        int ret = LowPower_WOM_SwitchToLNMode();
+        if (ret != 0) {
+            printf("LOW_POWER: ERROR - Failed to switch to LN mode: %d\r\n", ret);
+            return -2;
+        }
+
+        // 启动检测流程
+        ret = LowPower_StartDetectionProcess();
+        if (ret != 0) {
+            printf("LOW_POWER: ERROR - Failed to start detection: %d\r\n", ret);
+            return -3;
+        }
+
+        return 1;  // 表示需要运行检测流程
+    }
+#else
+    // RTC模式：检查是否有RTC唤醒事件
     if (RTC_Wakeup_IsPending()) {
         if (g_low_power_manager.debug_enabled) {
-            printf("LOW_POWER: Processing wakeup event\r\n");
+            printf("LOW_POWER: Processing RTC wakeup event\r\n");
         }
 
         // 处理RTC唤醒
@@ -539,6 +666,660 @@ int LowPower_ProcessMainLoop(void)
 
         return 1;  // 表示需要运行检测流程
     }
+#endif
 
     return 0;  // 无事件，继续等待
+}
+
+/* ============================================================================
+ * WOM管理函数实现
+ * ============================================================================ */
+
+/**
+ * @brief 配置WOM阈值
+ */
+int LowPower_WOM_Configure(uint8_t threshold_x, uint8_t threshold_y, uint8_t threshold_z)
+{
+    int rc = 0;
+    uint8_t readback[3] = {0};
+
+    if (g_low_power_manager.debug_enabled) {
+        printf("WOM: Configuring WOM thresholds...\r\n");
+    }
+
+    // 切换到Bank 4
+    rc = inv_iim423xx_set_reg_bank(&icm_driver, 4);
+    if (rc != 0) {
+        printf("WOM: ERROR - Failed to switch to Bank 4: %d\r\n", rc);
+        return -1;
+    }
+
+    // 写入WOM阈值（逐个寄存器写入）
+    rc = inv_iim423xx_write_reg(&icm_driver, MPUREG_ACCEL_WOM_X_THR_B4, 1, &threshold_x);
+    if (rc != 0) {
+        printf("WOM: ERROR - Failed to write WOM X threshold: %d\r\n", rc);
+        inv_iim423xx_set_reg_bank(&icm_driver, 0);
+        return -2;
+    }
+
+    rc = inv_iim423xx_write_reg(&icm_driver, MPUREG_ACCEL_WOM_Y_THR_B4, 1, &threshold_y);
+    if (rc != 0) {
+        printf("WOM: ERROR - Failed to write WOM Y threshold: %d\r\n", rc);
+        inv_iim423xx_set_reg_bank(&icm_driver, 0);
+        return -2;
+    }
+
+    rc = inv_iim423xx_write_reg(&icm_driver, MPUREG_ACCEL_WOM_Z_THR_B4, 1, &threshold_z);
+    if (rc != 0) {
+        printf("WOM: ERROR - Failed to write WOM Z threshold: %d\r\n", rc);
+        inv_iim423xx_set_reg_bank(&icm_driver, 0);
+        return -2;
+    }
+
+    // 读回验证
+    rc = inv_iim423xx_read_reg(&icm_driver, MPUREG_ACCEL_WOM_X_THR_B4, 1, &readback[0]);
+    rc |= inv_iim423xx_read_reg(&icm_driver, MPUREG_ACCEL_WOM_Y_THR_B4, 1, &readback[1]);
+    rc |= inv_iim423xx_read_reg(&icm_driver, MPUREG_ACCEL_WOM_Z_THR_B4, 1, &readback[2]);
+    if (rc != 0) {
+        printf("WOM: ERROR - Failed to read back WOM thresholds: %d\r\n", rc);
+        inv_iim423xx_set_reg_bank(&icm_driver, 0);
+        return -3;
+    }
+
+    // 验证
+    if (readback[0] != threshold_x || readback[1] != threshold_y || readback[2] != threshold_z) {
+        printf("WOM: ERROR - WOM threshold verification failed!\r\n");
+        printf("WOM: Expected: X=%d Y=%d Z=%d\r\n", threshold_x, threshold_y, threshold_z);
+        printf("WOM: Got:      X=%d Y=%d Z=%d\r\n", readback[0], readback[1], readback[2]);
+        inv_iim423xx_set_reg_bank(&icm_driver, 0);
+        return -4;
+    }
+
+    if (g_low_power_manager.debug_enabled) {
+        printf("WOM: Thresholds verified: X=%d (%.1f mg), Y=%d (%.1f mg), Z=%d (%.1f mg)\r\n",
+               threshold_x, threshold_x * 3.9f,
+               threshold_y, threshold_y * 3.9f,
+               threshold_z, threshold_z * 3.9f);
+    }
+
+    // 切换回Bank 0
+    rc = inv_iim423xx_set_reg_bank(&icm_driver, 0);
+    if (rc != 0) {
+        printf("WOM: ERROR - Failed to switch to Bank 0: %d\r\n", rc);
+        return -5;
+    }
+
+    // 更新配置
+    g_low_power_manager.wom_threshold_x = threshold_x;
+    g_low_power_manager.wom_threshold_y = threshold_y;
+    g_low_power_manager.wom_threshold_z = threshold_z;
+
+    printf("WOM: WOM thresholds configured successfully\r\n");
+    return 0;
+}
+
+/**
+ * @brief 使能WOM模式（配置传感器为LP+WOM）
+ * 参考IIM-42352数据手册Section 8.7和参考工程guard_sensor.c
+ */
+int LowPower_WOM_Enable(void)
+{
+    int rc = 0;
+    uint8_t reg_value = 0;
+    uint8_t pwr_mgmt0_val = 0;
+    uint8_t accel_config0_val = 0;
+    uint8_t int_status = 0;
+    uint8_t int_status2 = 0;
+    uint8_t int_status3 = 0;
+
+    printf("WOM: Enabling WOM mode (following datasheet section 8.7)...\r\n");
+
+    // ===== 禁用NVIC中断防止配置过程中的误触发 =====
+    printf("WOM: Disabling NVIC interrupt during configuration...\r\n");
+    HAL_NVIC_DisableIRQ(EXTI9_5_IRQn);
+    HAL_NVIC_ClearPendingIRQ(EXTI9_5_IRQn);
+
+    // 确保在Bank 0
+    rc = inv_iim423xx_set_reg_bank(&icm_driver, 0);
+    if (rc != 0) {
+        printf("WOM: ERROR - Failed to switch to Bank 0: %d\r\n", rc);
+        return -1;
+    }
+
+    // ===== STEP 0: 配置加速度计为LP模式50Hz（WOM前提条件） =====
+    printf("WOM: STEP 0: Configuring accelerometer to LP mode 50Hz...\r\n");
+
+    // 先禁用加速度计
+    printf("WOM:   Disabling accelerometer...\r\n");
+    rc = inv_iim423xx_disable_accel(&icm_driver);
+    if (rc != 0) {
+        printf("WOM: ERROR - Failed to disable accel: %d\r\n", rc);
+        return -1;
+    }
+    HAL_Delay(50);  // 等待传感器关闭
+
+    // 使能LP模式（使用驱动函数）
+    printf("WOM:   Enabling Low Power mode...\r\n");
+    rc = inv_iim423xx_enable_accel_low_power_mode(&icm_driver);
+    if (rc != 0) {
+        printf("WOM: ERROR - Failed to enable LP mode: %d\r\n", rc);
+        return -1;
+    }
+
+    // 设置ODR为50Hz
+    rc = inv_iim423xx_read_reg(&icm_driver, MPUREG_ACCEL_CONFIG0, 1, &accel_config0_val);
+    printf("WOM:   ACCEL_CONFIG0 current: 0x%02X\r\n", accel_config0_val);
+
+    accel_config0_val &= ~0x0F;  // 清除ODR位
+    accel_config0_val |= 0x09;   // 设置为50Hz (ODR=9)
+    rc = inv_iim423xx_write_reg(&icm_driver, MPUREG_ACCEL_CONFIG0, 1, &accel_config0_val);
+    if (rc != 0) {
+        printf("WOM: ERROR - Failed to set ODR to 50Hz: %d\r\n", rc);
+        return -1;
+    }
+    printf("WOM:   ACCEL_CONFIG0 new: 0x%02X (50Hz)\r\n", accel_config0_val);
+
+    // 等待模式切换稳定
+    HAL_Delay(50);
+
+    // ===== STEP 1: 禁用所有INT1中断源（关键！避免误触发） =====
+    printf("WOM: STEP 1: Disabling ALL INT1 interrupt sources...\r\n");
+
+    // 禁用INT_SOURCE0中的所有中断
+    uint8_t int_source0 = 0x00;  // 全部禁用
+    rc = inv_iim423xx_write_reg(&icm_driver, MPUREG_INT_SOURCE0, 1, &int_source0);
+    if (rc != 0) {
+        printf("WOM: ERROR - Failed to write INT_SOURCE0: %d\r\n", rc);
+        return -2;
+    }
+    printf("WOM:   INT_SOURCE0 = 0x00 (all disabled)\r\n");
+
+    // 禁用INT_SOURCE1中的所有中断（稍后会重新使能WOM）
+    reg_value = 0x00;
+    rc = inv_iim423xx_write_reg(&icm_driver, MPUREG_INT_SOURCE1, 1, &reg_value);
+    if (rc != 0) {
+        printf("WOM: ERROR - Failed to write INT_SOURCE1: %d\r\n", rc);
+        return -3;
+    }
+    printf("WOM:   INT_SOURCE1 = 0x00 (all disabled)\r\n");
+
+    // 等待中断源禁用生效
+    HAL_Delay(10);
+
+    // 验证INT_SOURCE0确实被禁用
+    rc = inv_iim423xx_read_reg(&icm_driver, MPUREG_INT_SOURCE0, 1, &int_source0);
+    if (rc == 0) {
+        printf("WOM:   Verified INT_SOURCE0 = 0x%02X\r\n", int_source0);
+        if (int_source0 != 0x00) {
+            printf("WOM: WARNING - INT_SOURCE0 not 0x00! Re-writing...\r\n");
+            int_source0 = 0x00;
+            inv_iim423xx_write_reg(&icm_driver, MPUREG_INT_SOURCE0, 1, &int_source0);
+        }
+    }
+
+    // ===== STEP 2: 路由WOM中断到INT1 =====
+    printf("WOM: STEP 2: Routing WOM interrupts to INT1...\r\n");
+    rc = inv_iim423xx_read_reg(&icm_driver, MPUREG_INT_SOURCE1, 1, &reg_value);
+    if (rc != 0) {
+        printf("WOM: ERROR - Failed to read INT_SOURCE1: %d\r\n", rc);
+        return -4;
+    }
+    printf("WOM:   INT_SOURCE1 current: 0x%02X\r\n", reg_value);
+
+    // 使能X和Y轴WOM中断（Z轴受重力影响，禁用）
+    reg_value |= BIT_INT_SOURCE1_WOM_X_INT1_EN;
+    reg_value |= BIT_INT_SOURCE1_WOM_Y_INT1_EN;
+    // reg_value |= BIT_INT_SOURCE1_WOM_Z_INT1_EN;  // Z轴禁用
+
+    rc = inv_iim423xx_write_reg(&icm_driver, MPUREG_INT_SOURCE1, 1, &reg_value);
+    if (rc != 0) {
+        printf("WOM: ERROR - Failed to write INT_SOURCE1: %d\r\n", rc);
+        return -5;
+    }
+    printf("WOM:   INT_SOURCE1 new: 0x%02X (WOM X/Y enabled)\r\n", reg_value);
+
+    // ===== STEP 3: 等待50ms（数据手册要求） =====
+    printf("WOM: STEP 3: Waiting 50ms as per datasheet...\r\n");
+    HAL_Delay(50);
+
+    // ===== STEP 4: 使能WOM模式 =====
+    printf("WOM: STEP 4: Enabling WOM mode in SMD_CONFIG...\r\n");
+    rc = inv_iim423xx_read_reg(&icm_driver, MPUREG_SMD_CONFIG, 1, &reg_value);
+    if (rc != 0) {
+        printf("WOM: ERROR - Failed to read SMD_CONFIG: %d\r\n", rc);
+        return -6;
+    }
+    printf("WOM:   SMD_CONFIG current: 0x%02X\r\n", reg_value);
+
+    // 配置WOM模式
+    // 注意：头文件中的位定义是错误的！正确的位定义是：
+    // Bit 4:3 = SMD_MODE (00=DISABLED, 01=WOM, 10=SMD_SHORT, 11=SMD_LONG)
+    // Bit 2   = WOM_INT_MODE (0=OR, 1=AND)
+    // Bit 1:0 = WOM_MODE (00=CMP_INIT, 01=CMP_PREV)
+
+    // 清除所有WOM相关位
+    reg_value &= 0xE0;  // 保留Bit 7:5，清除Bit 4:0
+
+    // 设置SMD_MODE = 1 (WOM) at Bit 4:3
+    reg_value |= (1 << 3);  // 0x08
+
+    // 设置WOM_INT_MODE = 0 (OR) at Bit 2
+    if (g_low_power_manager.wom_int_mode == 1) {
+        reg_value |= (1 << 2);  // 0x04
+    }
+
+    // 设置WOM_MODE = 1 (CMP_PREV) at Bit 1:0
+    if (g_low_power_manager.wom_mode == 1) {
+        reg_value |= 0x01;
+    }
+
+    rc = inv_iim423xx_write_reg(&icm_driver, MPUREG_SMD_CONFIG, 1, &reg_value);
+    if (rc != 0) {
+        printf("WOM: ERROR - Failed to write SMD_CONFIG: %d\r\n", rc);
+        return -7;
+    }
+    printf("WOM:   SMD_CONFIG new: 0x%02X (WOM enabled)\r\n", reg_value);
+
+    // ===== STEP 5: 等待WOM稳定 =====
+    printf("WOM: STEP 5: Waiting 500ms for WOM to stabilize...\r\n");
+    HAL_Delay(500);
+
+    // ===== STEP 6: 清除所有中断状态并使能NVIC中断 =====
+    printf("WOM: STEP 6: Clearing all interrupt status and enabling NVIC...\r\n");
+
+    // 清除所有中断状态寄存器（读取即清除）
+    inv_iim423xx_read_reg(&icm_driver, MPUREG_INT_STATUS, 1, &int_status);
+    if (int_status != 0) {
+        printf("WOM:   Cleared INT_STATUS: 0x%02X\r\n", int_status);
+    }
+
+    inv_iim423xx_read_reg(&icm_driver, MPUREG_INT_STATUS2, 1, &int_status2);
+    if (int_status2 != 0) {
+        printf("WOM:   Cleared INT_STATUS2: 0x%02X\r\n", int_status2);
+    }
+
+    inv_iim423xx_read_reg(&icm_driver, MPUREG_INT_STATUS3, 1, &int_status3);
+    if (int_status3 != 0) {
+        printf("WOM:   Cleared INT_STATUS3: 0x%02X\r\n", int_status3);
+    }
+
+    // 清除GPIO pending中断
+    HAL_NVIC_ClearPendingIRQ(EXTI9_5_IRQn);
+
+    // 使能NVIC中断
+    printf("WOM:   Enabling NVIC interrupt...\r\n");
+    HAL_NVIC_EnableIRQ(EXTI9_5_IRQn);
+
+    // ===== STEP 7: 验证最终配置 =====
+    printf("WOM: STEP 7: Verifying final configuration...\r\n");
+
+    // 读取PWR_MGMT_0验证加速度计模式（重用之前的变量）
+    rc = inv_iim423xx_read_reg(&icm_driver, MPUREG_PWR_MGMT_0, 1, &pwr_mgmt0_val);
+    printf("WOM:   PWR_MGMT_0 = 0x%02X (ACCEL_MODE = %d)\r\n", pwr_mgmt0_val, pwr_mgmt0_val & 0x03);
+
+    // 读取ACCEL_CONFIG0验证ODR（重用之前的变量）
+    rc = inv_iim423xx_read_reg(&icm_driver, MPUREG_ACCEL_CONFIG0, 1, &accel_config0_val);
+    printf("WOM:   ACCEL_CONFIG0 = 0x%02X (ODR = %d)\r\n", accel_config0_val, accel_config0_val & 0x0F);
+
+    // 读取INT_SOURCE1验证WOM中断路由
+    rc = inv_iim423xx_read_reg(&icm_driver, MPUREG_INT_SOURCE1, 1, &reg_value);
+    printf("WOM:   INT_SOURCE1 = 0x%02X (WOM routing)\r\n", reg_value);
+
+    // 读取SMD_CONFIG验证WOM使能
+    rc = inv_iim423xx_read_reg(&icm_driver, MPUREG_SMD_CONFIG, 1, &reg_value);
+    printf("WOM:   SMD_CONFIG = 0x%02X (WOM mode = %d)\r\n", reg_value, (reg_value >> 3) & 0x03);
+
+    // 读取INT_STATUS2检查当前中断状态（重用之前的变量）
+    rc = inv_iim423xx_read_reg(&icm_driver, MPUREG_INT_STATUS2, 1, &int_status2);
+    printf("WOM:   INT_STATUS2 = 0x%02X (should be 0x00 after clearing)\r\n", int_status2);
+
+    g_low_power_manager.is_lp_mode = true;
+    printf("WOM: WOM mode enabled successfully\r\n");
+    printf("WOM: System ready to detect motion. Shake the sensor to trigger WOM!\r\n");
+
+    // 最终验证：读取几个加速度样本，确认传感器在LP模式下采样
+    printf("\r\nWOM: Final verification - Reading accel samples in LP mode...\r\n");
+    for (int i = 0; i < 5; i++) {
+        HAL_Delay(100);  // 等待100ms (LP模式50Hz，应该有5个新样本)
+
+        // 读取加速度数据
+        uint8_t accel_data[6];
+        rc = inv_iim423xx_read_reg(&icm_driver, MPUREG_ACCEL_DATA_X0_UI, 6, accel_data);
+        if (rc == 0) {
+            int16_t ax = (int16_t)((accel_data[0] << 8) | accel_data[1]);
+            int16_t ay = (int16_t)((accel_data[2] << 8) | accel_data[3]);
+            int16_t az = (int16_t)((accel_data[4] << 8) | accel_data[5]);
+
+            // 转换为mg (±4g range, 16-bit: 1 LSB = 4000/32768 = 0.122 mg)
+            float ax_mg = ax * 0.122f;
+            float ay_mg = ay * 0.122f;
+            float az_mg = az * 0.122f;
+
+            printf("  Sample %d: X=%.0f Y=%.0f Z=%.0f mg\r\n", i+1, ax_mg, ay_mg, az_mg);
+        }
+    }
+    printf("WOM: If samples are changing, sensor is sampling in LP mode.\r\n");
+    printf("WOM: If samples are frozen, sensor might not be in LP mode!\r\n\r\n");
+
+    return 0;
+}
+
+/**
+ * @brief 禁用WOM模式
+ */
+int LowPower_WOM_Disable(void)
+{
+    int rc = 0;
+    uint8_t reg_value = 0;
+
+    printf("WOM: Disabling WOM mode...\r\n");
+
+    // 禁用NVIC中断
+    HAL_NVIC_DisableIRQ(EXTI9_5_IRQn);
+
+    // 切换到Bank 0
+    rc = inv_iim423xx_set_reg_bank(&icm_driver, 0);
+    if (rc != 0) {
+        printf("WOM: ERROR - Failed to switch to Bank 0: %d\r\n", rc);
+        return -1;
+    }
+
+    // 禁用WOM
+    rc = inv_iim423xx_read_reg(&icm_driver, MPUREG_SMD_CONFIG, 1, &reg_value);
+    reg_value &= ~BIT_SMD_CONFIG_SMD_MODE_MASK;  // 设置为disabled (0)
+    rc |= inv_iim423xx_write_reg(&icm_driver, MPUREG_SMD_CONFIG, 1, &reg_value);
+    if (rc != 0) {
+        printf("WOM: ERROR - Failed to disable WOM: %d\r\n", rc);
+        return -2;
+    }
+
+    // 清除中断状态
+    uint8_t int_status;
+    inv_iim423xx_read_reg(&icm_driver, MPUREG_INT_STATUS2, 1, &int_status);
+
+    g_low_power_manager.is_lp_mode = false;
+    printf("WOM: WOM mode disabled\r\n");
+
+    return 0;
+}
+
+/**
+ * @brief 切换到LN模式（1000Hz高性能模式）
+ */
+int LowPower_WOM_SwitchToLNMode(void)
+{
+    int rc = 0;
+
+    if (g_low_power_manager.debug_enabled) {
+        printf("WOM: Switching to LN mode (1000Hz)...\r\n");
+    }
+
+    // 禁用WOM
+    rc = LowPower_WOM_Disable();
+    if (rc != 0) {
+        printf("WOM: ERROR - Failed to disable WOM: %d\r\n", rc);
+        return -1;
+    }
+
+    // 设置为LN模式，1000Hz
+    rc = inv_iim423xx_set_accel_frequency(&icm_driver, IIM423XX_ACCEL_CONFIG0_ODR_1_KHZ);
+    if (rc != 0) {
+        printf("WOM: ERROR - Failed to set ODR to 1000Hz: %d\r\n", rc);
+        return -2;
+    }
+
+    // 等待传感器启动（10ms）
+    HAL_Delay(10);
+
+    g_low_power_manager.is_lp_mode = false;
+
+    if (g_low_power_manager.debug_enabled) {
+        printf("WOM: Switched to LN mode successfully\r\n");
+    }
+
+    return 0;
+}
+
+/**
+ * @brief 切换到LP+WOM模式（50Hz低功耗模式）
+ */
+int LowPower_WOM_SwitchToLPMode(void)
+{
+    if (g_low_power_manager.debug_enabled) {
+        printf("WOM: Switching to LP+WOM mode (50Hz)...\r\n");
+    }
+
+    // 重新配置WOM
+    int rc = LowPower_WOM_Configure(g_low_power_manager.wom_threshold_x,
+                                    g_low_power_manager.wom_threshold_y,
+                                    g_low_power_manager.wom_threshold_z);
+    if (rc != 0) {
+        printf("WOM: ERROR - Failed to configure WOM: %d\r\n", rc);
+        return -1;
+    }
+
+    // 使能WOM
+    rc = LowPower_WOM_Enable();
+    if (rc != 0) {
+        printf("WOM: ERROR - Failed to enable WOM: %d\r\n", rc);
+        return -2;
+    }
+
+    if (g_low_power_manager.debug_enabled) {
+        printf("WOM: Switched to LP+WOM mode successfully\r\n");
+    }
+
+    return 0;
+}
+
+/**
+ * @brief 检查WOM是否触发
+ */
+bool LowPower_WOM_IsTriggered(void)
+{
+    return g_wom_triggered;
+}
+
+/**
+ * @brief 清除WOM触发标志
+ */
+void LowPower_WOM_ClearTrigger(void)
+{
+    g_wom_triggered = false;
+}
+
+/**
+ * @brief WOM中断处理函数（在EXTI中断中调用）
+ * 参考参考工程guard_sensor.c的实现，添加INT_STATUS2验证
+ */
+void LowPower_WOM_IRQHandler(void)
+{
+    static uint32_t total_irq_count = 0;
+    uint8_t int_status = 0;
+    uint8_t int_status2 = 0;
+    uint8_t int_status3 = 0;
+    int rc = 0;
+
+    total_irq_count++;
+
+    // 详细调试：打印每次中断
+    printf("\r\n[IRQ #%lu] WOM_IRQHandler called\r\n", total_irq_count);
+
+    // 读取所有中断状态寄存器
+    rc = inv_iim423xx_read_reg(&icm_driver, MPUREG_INT_STATUS, 1, &int_status);
+    if (rc != 0) {
+        printf("  ERROR - Failed to read INT_STATUS: %d\r\n", rc);
+        return;
+    }
+
+    rc = inv_iim423xx_read_reg(&icm_driver, MPUREG_INT_STATUS2, 1, &int_status2);
+    if (rc != 0) {
+        printf("  ERROR - Failed to read INT_STATUS2: %d\r\n", rc);
+        return;
+    }
+
+    rc = inv_iim423xx_read_reg(&icm_driver, MPUREG_INT_STATUS3, 1, &int_status3);
+    if (rc != 0) {
+        printf("  ERROR - Failed to read INT_STATUS3: %d\r\n", rc);
+        return;
+    }
+
+    // 打印所有中断状态
+    printf("  INT_STATUS:  0x%02X\r\n", int_status);
+    printf("  INT_STATUS2: 0x%02X (WOM_X=%d, WOM_Y=%d, WOM_Z=%d)\r\n",
+           int_status2,
+           int_status2 & 0x01,
+           (int_status2 >> 1) & 0x01,
+           (int_status2 >> 2) & 0x01);
+    printf("  INT_STATUS3: 0x%02X\r\n", int_status3);
+
+    // 验证WOM标志（Bit 0=X, Bit 1=Y, Bit 2=Z）
+    if ((int_status2 & 0x07) == 0) {
+        // 这是误触发（GPIO噪声或其他中断源）
+        g_low_power_manager.wom_false_alarm_count++;
+        printf("  Result: FALSE ALARM (no WOM bits set)\r\n");
+        printf("  False alarm count: %lu\r\n\r\n", g_low_power_manager.wom_false_alarm_count);
+        return;
+    }
+
+    // 真正的WOM中断
+    // 注意：只设置标志，不要在ISR中进行SPI通信！
+    g_wom_triggered = true;
+    g_low_power_manager.wom_trigger_count++;
+    g_low_power_manager.last_wom_trigger_time = HAL_GetTick();
+
+    printf("  Result: *** WOM TRIGGERED! ***\r\n");
+    printf("  Trigger count: %lu\r\n", g_low_power_manager.wom_trigger_count);
+    printf("  Time: %lu ms\r\n\r\n", g_low_power_manager.last_wom_trigger_time);
+}
+
+/**
+ * @brief 获取WOM统计信息
+ */
+void LowPower_WOM_GetStatistics(uint32_t* trigger_count, uint32_t* false_alarm_count)
+{
+    if (trigger_count != NULL) {
+        *trigger_count = g_low_power_manager.wom_trigger_count;
+    }
+    if (false_alarm_count != NULL) {
+        *false_alarm_count = g_low_power_manager.wom_false_alarm_count;
+    }
+}
+
+/**
+ * @brief 读取并打印所有WOM相关寄存器（用于调试）
+ */
+void LowPower_WOM_DumpRegisters(void)
+{
+    uint8_t reg_value = 0;
+
+    printf("\r\n========================================\r\n");
+    printf("  WOM REGISTER DUMP\r\n");
+    printf("========================================\r\n");
+
+    // Bank 0寄存器
+    inv_iim423xx_set_reg_bank(&icm_driver, 0);
+
+    // PWR_MGMT_0 (0x4E)
+    inv_iim423xx_read_reg(&icm_driver, MPUREG_PWR_MGMT_0, 1, &reg_value);
+    printf("PWR_MGMT_0 (0x4E):     0x%02X\r\n", reg_value);
+    printf("  ACCEL_MODE:          %d ", reg_value & 0x03);
+    switch(reg_value & 0x03) {
+        case 0: printf("(OFF)\r\n"); break;
+        case 2: printf("(LP)\r\n"); break;
+        case 3: printf("(LN)\r\n"); break;
+        default: printf("(UNKNOWN)\r\n"); break;
+    }
+
+    // ACCEL_CONFIG0 (0x50)
+    inv_iim423xx_read_reg(&icm_driver, MPUREG_ACCEL_CONFIG0, 1, &reg_value);
+    printf("ACCEL_CONFIG0 (0x50):  0x%02X\r\n", reg_value);
+    printf("  ODR:                 %d ", reg_value & 0x0F);
+    switch(reg_value & 0x0F) {
+        case 6: printf("(1.5625Hz)\r\n"); break;
+        case 7: printf("(3.125Hz)\r\n"); break;
+        case 8: printf("(6.25Hz)\r\n"); break;
+        case 9: printf("(12.5Hz/50Hz)\r\n"); break;
+        case 10: printf("(25Hz/100Hz)\r\n"); break;
+        case 11: printf("(50Hz/200Hz)\r\n"); break;
+        case 12: printf("(100Hz/500Hz)\r\n"); break;
+        case 13: printf("(200Hz/1kHz)\r\n"); break;
+        case 14: printf("(500Hz/2kHz)\r\n"); break;
+        default: printf("(UNKNOWN)\r\n"); break;
+    }
+    printf("  FSR:                 %d ", (reg_value >> 5) & 0x03);
+    switch((reg_value >> 5) & 0x03) {
+        case 0: printf("(±16g)\r\n"); break;
+        case 1: printf("(±8g)\r\n"); break;
+        case 2: printf("(±4g)\r\n"); break;
+        case 3: printf("(±2g)\r\n"); break;
+    }
+
+    // INT_CONFIG (0x14)
+    inv_iim423xx_read_reg(&icm_driver, MPUREG_INT_CONFIG, 1, &reg_value);
+    printf("INT_CONFIG (0x14):     0x%02X\r\n", reg_value);
+    printf("  INT1_POLARITY:       %d (%s)\r\n", reg_value & 0x01, (reg_value & 0x01) ? "HIGH" : "LOW");
+    printf("  INT1_DRIVE:          %d (%s)\r\n", (reg_value >> 1) & 0x01, ((reg_value >> 1) & 0x01) ? "PP" : "OD");
+
+    // INT_CONFIG0 (0x63)
+    inv_iim423xx_read_reg(&icm_driver, MPUREG_INT_CONFIG0, 1, &reg_value);
+    printf("INT_CONFIG0 (0x63):    0x%02X\r\n", reg_value);
+
+    // INT_CONFIG1 (0x64)
+    inv_iim423xx_read_reg(&icm_driver, MPUREG_INT_CONFIG1, 1, &reg_value);
+    printf("INT_CONFIG1 (0x64):    0x%02X\r\n", reg_value);
+
+    // INT_SOURCE0 (0x65)
+    inv_iim423xx_read_reg(&icm_driver, MPUREG_INT_SOURCE0, 1, &reg_value);
+    printf("INT_SOURCE0 (0x65):    0x%02X\r\n", reg_value);
+    printf("  UI_DRDY_INT1_EN:     %d\r\n", (reg_value >> 3) & 0x01);
+
+    // INT_SOURCE1 (0x66)
+    inv_iim423xx_read_reg(&icm_driver, MPUREG_INT_SOURCE1, 1, &reg_value);
+    printf("INT_SOURCE1 (0x66):    0x%02X\r\n", reg_value);
+    printf("  WOM_X_INT1_EN:       %d\r\n", reg_value & 0x01);
+    printf("  WOM_Y_INT1_EN:       %d\r\n", (reg_value >> 1) & 0x01);
+    printf("  WOM_Z_INT1_EN:       %d\r\n", (reg_value >> 2) & 0x01);
+
+    // SMD_CONFIG (0x6B)
+    inv_iim423xx_read_reg(&icm_driver, MPUREG_SMD_CONFIG, 1, &reg_value);
+    printf("SMD_CONFIG (0x6B):     0x%02X\r\n", reg_value);
+    printf("  SMD_MODE:            %d ", (reg_value >> 3) & 0x03);
+    switch((reg_value >> 3) & 0x03) {
+        case 0: printf("(DISABLED)\r\n"); break;
+        case 1: printf("(WOM)\r\n"); break;
+        case 2: printf("(SMD_SHORT)\r\n"); break;
+        case 3: printf("(SMD_LONG)\r\n"); break;
+    }
+    printf("  WOM_INT_MODE:        %d (%s)\r\n", (reg_value >> 2) & 0x01, ((reg_value >> 2) & 0x01) ? "AND" : "OR");
+    printf("  WOM_MODE:            %d (%s)\r\n", reg_value & 0x03, (reg_value & 0x03) ? "CMP_PREV" : "CMP_INIT");
+
+    // INT_STATUS (0x2D)
+    inv_iim423xx_read_reg(&icm_driver, MPUREG_INT_STATUS, 1, &reg_value);
+    printf("INT_STATUS (0x2D):     0x%02X\r\n", reg_value);
+
+    // INT_STATUS2 (0x37)
+    inv_iim423xx_read_reg(&icm_driver, MPUREG_INT_STATUS2, 1, &reg_value);
+    printf("INT_STATUS2 (0x37):    0x%02X\r\n", reg_value);
+    printf("  WOM_X:               %d\r\n", reg_value & 0x01);
+    printf("  WOM_Y:               %d\r\n", (reg_value >> 1) & 0x01);
+    printf("  WOM_Z:               %d\r\n", (reg_value >> 2) & 0x01);
+
+    // Bank 4寄存器 - WOM阈值
+    inv_iim423xx_set_reg_bank(&icm_driver, 4);
+
+    uint8_t wom_x, wom_y, wom_z;
+    inv_iim423xx_read_reg(&icm_driver, MPUREG_ACCEL_WOM_X_THR_B4, 1, &wom_x);
+    inv_iim423xx_read_reg(&icm_driver, MPUREG_ACCEL_WOM_Y_THR_B4, 1, &wom_y);
+    inv_iim423xx_read_reg(&icm_driver, MPUREG_ACCEL_WOM_Z_THR_B4, 1, &wom_z);
+
+    printf("\r\n--- Bank 4 Registers ---\r\n");
+    printf("WOM_X_THR (0x4A):      %d (%.1f mg)\r\n", wom_x, wom_x * 3.9f);
+    printf("WOM_Y_THR (0x4B):      %d (%.1f mg)\r\n", wom_y, wom_y * 3.9f);
+    printf("WOM_Z_THR (0x4C):      %d (%.1f mg)\r\n", wom_z, wom_z * 3.9f);
+
+    // 切换回Bank 0
+    inv_iim423xx_set_reg_bank(&icm_driver, 0);
+
+    printf("========================================\r\n\r\n");
 }

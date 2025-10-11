@@ -38,7 +38,8 @@
  * -------------------------------------------------------------------------------------- */
 
 /* Just a handy variable to handle the iim423xx object */
-static struct inv_iim423xx icm_driver;
+/* Changed from static to allow access from low_power_manager.c for WOM configuration */
+struct inv_iim423xx icm_driver;
 
 /* structure allowing to handle clock calibration */
 static clk_calib_t clk_calib;
