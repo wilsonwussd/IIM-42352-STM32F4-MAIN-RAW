@@ -67,6 +67,15 @@ void Error_Handler(void);
 /* PE14 GPIO Test Function */
 void Test_PE14_GPIO(void);
 
+/* LoRa Power Control (PE14) */
+#define LORA_POWER_PIN          GPIO_PIN_14
+#define LORA_POWER_PORT         GPIOE
+#define LORA_STARTUP_DELAY_MS   300  // LoRa module startup and connection time
+
+void LoRa_Power_On(void);
+void LoRa_Power_Off(void);
+uint8_t LoRa_Is_Power_On(void);
+
 /* Global variables */
 extern volatile uint32_t irq_from_device;
 /* USER CODE END EFP */

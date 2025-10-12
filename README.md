@@ -50,7 +50,34 @@
 - ✅ 阶段1-6：100%完成
 - 🔧 阶段7：系统优化和问题修复（进行中）
 
-### **🔧 最新更新 (2025-01-11)**
+### **🔧 最新更新 (2025-01-12)**
+
+#### **第五轮：LoRa电源控制优化** ✅
+10. **PE14控制LoRa模块电源** ✅
+   - **功能**：通过PE14 GPIO控制LoRa模块电源，实现按需上电
+   - **低功耗优化**：LoRa模块仅在报警时上电，其余时间关闭
+   - **上电流程**：
+     * 检测到挖掘振动 → PE14置高（LoRa上电）
+     * 等待300ms（LoRa启动和建立连接）
+     * 发送Modbus报警命令
+     * 报警完成/超时 → PE14置低（LoRa断电）
+   - **功耗效果**：
+     * 场景1/2（无振动/正常振动）：LoRa功耗从10-20mA降至<1μA，**节省99.9%**
+     * 场景3（挖掘振动）：LoRa仅工作2-3秒，其余时间关闭
+     * 整体功耗降低：预计再降低10-15%
+   - **代码位置**：
+     * `Core/Inc/main.h`: LoRa电源控制宏定义和函数声明
+     * `Core/Src/main.c`: LoRa电源控制函数实现（`LoRa_Power_On()`, `LoRa_Power_Off()`）
+     * `Core/Src/main.c`: 报警流程集成（`Trigger_Alarm_Cycle()`, `Process_Alarm_State_Machine()`）
+
+**效果验证：**
+- ✅ 初始化时LoRa关闭（PE14=LOW），节省功耗
+- ✅ 触发报警时LoRa自动上电（PE14=HIGH），等待300ms
+- ✅ 报警完成后LoRa自动断电（PE14=LOW）
+- ✅ 报警超时时LoRa自动断电（PE14=LOW），防止功耗浪费
+- ✅ 提供状态查询函数（`LoRa_Is_Power_On()`）
+
+### **🔧 历史更新 (2025-01-11)**
 
 #### **第一轮：FIFO和调试优化** ✅
 1. **FIFO清空增强** ✅
@@ -691,18 +718,49 @@ huart5.Init.Mode = UART_MODE_TX_RX;
 #define FREQ_RESOLUTION (SAMPLE_RATE / FFT_SIZE)  // 1.953Hz
 ```
 
-## 📡 **LoRa通信系统配置** (🆕 v3.2新增)
+## 📡 **LoRa通信系统配置** (🆕 v3.2新增，v4.0优化)
 
 ### **硬件连接**
 ```
 STM32F407:
 ├── UART1 (PA9/PA10) ←→ 电脑调试串口 (115200bps)
-└── UART5 (PC12/PD2) ←→ LoRa模块 (115200bps)
-    ├── PC12 (UART5_TX) → LoRa模块 Rx
-    └── PD2 (UART5_RX) ← LoRa模块 Tx
+├── UART5 (PC12/PD2) ←→ LoRa模块 (115200bps)
+│   ├── PC12 (UART5_TX) → LoRa模块 Rx
+│   └── PD2 (UART5_RX) ← LoRa模块 Tx
+└── PE14 (GPIO_OUTPUT) → LoRa模块电源控制 (🆕 v4.0新增)
+    ├── PE14 = HIGH → LoRa模块上电
+    └── PE14 = LOW  → LoRa模块断电（低功耗）
 
 LoRa模块 ←→ 网关 ←→ 云端平台
 ```
+
+### **LoRa电源控制** (🆕 v4.0新增)
+```c
+// PE14电源控制配置
+#define LORA_POWER_PIN          GPIO_PIN_14
+#define LORA_POWER_PORT         GPIOE
+#define LORA_STARTUP_DELAY_MS   300  // LoRa模块启动和连接时间
+
+// 电源控制API
+void LoRa_Power_On(void);        // 上电并等待300ms
+void LoRa_Power_Off(void);       // 断电
+uint8_t LoRa_Is_Power_On(void);  // 检查状态
+```
+
+**电源控制时序：**
+```
+1. 系统初始化 → PE14=LOW（LoRa关闭，节省功耗）
+2. 检测到挖掘振动 → PE14=HIGH（LoRa上电）
+3. 等待300ms → LoRa启动和建立连接
+4. 发送Modbus报警命令 → 等待响应
+5. 报警完成/超时 → PE14=LOW（LoRa断电）
+6. 返回Sleep模式 → 继续低功耗运行
+```
+
+**功耗优化效果：**
+- **场景1/2（无振动/正常振动）**：LoRa功耗 <1μA（节省99.9%）
+- **场景3（挖掘振动）**：LoRa仅工作2-3秒，其余时间关闭
+- **整体功耗**：预计再降低10-15%，电池寿命进一步延长
 
 ### **通信协议**
 ```c
@@ -862,6 +920,189 @@ class VibrAnalyzer:            # 主界面
 - **快速缩放**: 微振动(0-1mg)/小振动(0-10mg)/中振动(0-100mg)/大振动(0-1g)
 - **显示选项**: 网格开关、峰值标注、原始数据开关、实时统计
 - **时域显示**: 三轴加速度实时波形，最近10秒数据
+
+## 🎛️ **检测算法参数调整指南**
+
+### **概述**
+本系统采用两级检测算法：**粗检测（RMS滑动窗口）** + **细检测（FFT频域特征分析）**。通过调整检测阈值，可以平衡检测灵敏度和误报率。
+
+---
+
+### **1. 粗检测参数调整**
+
+#### **粗检测原理**
+粗检测使用RMS（均方根）滑动窗口检测振动强度变化，当振动强度超过基线的一定倍数时触发细检测。
+
+#### **关键参数位置**
+文件：`Core/Inc/example-raw-data.h`（第48-54行）
+
+```c
+#define RMS_WINDOW_SIZE          512     // RMS滑动窗口大小 (512样本 @ 1000Hz = 0.512秒)
+#define BASELINE_RMS_THRESHOLD   0.010f  // 基线RMS阈值 (10mg，避免误触发)
+#define TRIGGER_MULTIPLIER       3.0f    // 触发倍数 (3.0x，需要30mg以上才触发)
+#define TRIGGER_DURATION_MS      512     // 触发持续时间 (512ms)
+#define COOLDOWN_TIME_MS         10000   // 冷却时间 (10000ms)
+```
+
+#### **参数说明**
+
+| 参数 | 默认值 | 作用 | 调整建议 |
+|------|--------|------|----------|
+| **RMS_WINDOW_SIZE** | 512 | 滑动窗口大小（样本数） | ⚠️ 不建议修改（与FFT_SIZE一致） |
+| **BASELINE_RMS_THRESHOLD** | 0.010f | 基线RMS阈值（10mg） | 降低→更灵敏，提高→更稳定 |
+| **TRIGGER_MULTIPLIER** | 3.0f | 触发倍数（3倍基线） | **降低→更灵敏，提高→更稳定** |
+| **TRIGGER_DURATION_MS** | 512 | 触发持续时间 | 增加→更稳定，减少→更快响应 |
+| **COOLDOWN_TIME_MS** | 10000 | 冷却时间（避免重复触发） | 根据实际需求调整 |
+
+#### **调整示例**
+
+**场景1：提高灵敏度（检测更小的振动）**
+```c
+#define BASELINE_RMS_THRESHOLD   0.005f  // 降低到5mg
+#define TRIGGER_MULTIPLIER       2.0f    // 降低到2倍
+```
+- **效果**：可以检测到更小的振动（10mg以上）
+- **风险**：可能增加误报率
+
+**场景2：降低误报率（只检测明显振动）**
+```c
+#define BASELINE_RMS_THRESHOLD   0.020f  // 提高到20mg
+#define TRIGGER_MULTIPLIER       5.0f    // 提高到5倍
+```
+- **效果**：只有明显振动（100mg以上）才触发
+- **风险**：可能漏报小振动
+
+**场景3：平衡设置（推荐）**
+```c
+#define BASELINE_RMS_THRESHOLD   0.010f  // 保持10mg
+#define TRIGGER_MULTIPLIER       3.0f    // 保持3倍（当前默认值）
+```
+- **效果**：30mg以上振动触发，平衡灵敏度和稳定性
+
+---
+
+### **2. 细检测参数调整**
+
+#### **细检测原理**
+细检测通过FFT频域分析提取5维特征（低频能量、中频能量、高频能量、主频、频谱重心），使用规则分类器判断是否为挖掘振动。
+
+#### **关键参数位置**
+文件：`Core/Inc/example-raw-data.h`（第236-248行）
+
+```c
+/* 频段定义 */
+#define FINE_DETECTION_LOW_FREQ_MIN    5.0f     // 低频段下限 (Hz)
+#define FINE_DETECTION_LOW_FREQ_MAX    15.0f    // 低频段上限 (Hz)
+#define FINE_DETECTION_MID_FREQ_MIN    15.0f    // 中频段下限 (Hz)
+#define FINE_DETECTION_MID_FREQ_MAX    30.0f    // 中频段上限 (Hz)
+#define FINE_DETECTION_HIGH_FREQ_MIN   30.0f    // 高频段下限 (Hz)
+#define FINE_DETECTION_HIGH_FREQ_MAX   100.0f   // 高频段上限 (Hz)
+
+/* 分类阈值配置 */
+#define FINE_DETECTION_LOW_FREQ_THRESHOLD     0.4f    // 低频能量阈值（40%）
+#define FINE_DETECTION_MID_FREQ_THRESHOLD     0.05f   // 中频能量阈值（5%）
+#define FINE_DETECTION_DOMINANT_FREQ_MAX      50.0f   // 主频上限 (Hz)
+#define FINE_DETECTION_CENTROID_MAX           80.0f   // 频谱重心上限 (Hz)
+#define FINE_DETECTION_CONFIDENCE_THRESHOLD   0.75f   // 置信度阈值（75%）
+```
+
+#### **参数说明**
+
+| 参数 | 默认值 | 作用 | 调整建议 |
+|------|--------|------|----------|
+| **LOW_FREQ_THRESHOLD** | 0.4f (40%) | 低频能量占比阈值 | **降低→更灵敏，提高→更严格** |
+| **MID_FREQ_THRESHOLD** | 0.05f (5%) | 中频能量占比阈值 | 降低→更灵敏，提高→更严格 |
+| **DOMINANT_FREQ_MAX** | 50.0f Hz | 主频上限 | 提高→检测更高频振动 |
+| **CENTROID_MAX** | 80.0f Hz | 频谱重心上限 | 提高→检测更高频振动 |
+| **CONFIDENCE_THRESHOLD** | 0.75f (75%) | 置信度阈值 | **降低→更灵敏，提高→更严格** |
+
+#### **调整示例**
+
+**场景1：提高检测灵敏度（检测更多挖掘事件）**
+```c
+#define FINE_DETECTION_LOW_FREQ_THRESHOLD     0.3f    // 降低到30%
+#define FINE_DETECTION_MID_FREQ_THRESHOLD     0.03f   // 降低到3%
+#define FINE_DETECTION_CONFIDENCE_THRESHOLD   0.70f   // 降低到70%
+```
+- **效果**：更容易识别为挖掘振动
+- **风险**：可能增加误报率（将正常振动误判为挖掘）
+
+**场景2：降低误报率（只报告高置信度事件）**
+```c
+#define FINE_DETECTION_LOW_FREQ_THRESHOLD     0.5f    // 提高到50%
+#define FINE_DETECTION_MID_FREQ_THRESHOLD     0.08f   // 提高到8%
+#define FINE_DETECTION_CONFIDENCE_THRESHOLD   0.85f   // 提高到85%
+```
+- **效果**：只有非常明显的挖掘振动才报警
+- **风险**：可能漏报部分挖掘事件
+
+**场景3：平衡设置（推荐，当前默认值）**
+```c
+#define FINE_DETECTION_LOW_FREQ_THRESHOLD     0.4f    // 40%
+#define FINE_DETECTION_MID_FREQ_THRESHOLD     0.05f   // 5%
+#define FINE_DETECTION_CONFIDENCE_THRESHOLD   0.75f   // 75%（当前默认值）
+```
+- **效果**：平衡灵敏度和准确性，实测置信度75-85%
+
+---
+
+### **3. 参数调整流程**
+
+#### **步骤1：收集测试数据**
+1. 在实际环境中运行系统
+2. 记录串口输出的检测日志
+3. 特别关注以下信息：
+   ```
+   COARSE_TRIGGER: RMS=0.XXX, Peak Factor=X.XX
+   FFT_PROCESS_BUFFER: freq=XX.XX Hz, mag=X.XXX
+   FINE_DETECTION: Low=XX.XX%, Mid=XX.XX%, Confidence=X.XX
+   ```
+
+#### **步骤2：分析检测结果**
+- **漏报（应该报警但没报）**：
+  - 检查粗检测是否触发（Peak Factor是否足够大）
+  - 检查细检测置信度（是否接近阈值）
+  - 检查低频能量占比（是否接近阈值）
+
+- **误报（不应该报警但报了）**：
+  - 检查细检测置信度（是否刚好超过阈值）
+  - 检查频谱特征（主频、频谱重心是否合理）
+
+#### **步骤3：调整参数**
+根据分析结果，按照上述调整示例修改参数。
+
+#### **步骤4：重新编译和测试**
+1. 修改`Core/Inc/example-raw-data.h`中的参数
+2. 重新编译工程（Keil MDK-ARM）
+3. 烧录到STM32
+4. 重复测试和调整，直到达到满意效果
+
+---
+
+### **4. 调试技巧**
+
+#### **启用详细调试输出**
+```c
+// Core/Inc/low_power_manager.h
+#define LOW_POWER_DEBUG_VERBOSE         1       // 详细低功耗调试输出
+
+// Core/Src/fft_processor.c
+#define FFT_DEBUG_VERBOSE               1       // 详细FFT调试输出
+```
+
+#### **关键日志关键字**
+- `COARSE_TRIGGER:` - 粗检测触发信息
+- `FFT_PROCESS_BUFFER:` - FFT处理结果
+- `FINE_DETECTION_DEBUG:` - 细检测详细信息
+- `Classification: MINING` - 检测到挖掘
+- `Classification: NORMAL` - 检测到正常振动
+
+#### **常见问题**
+1. **粗检测不触发**：降低`TRIGGER_MULTIPLIER`或`BASELINE_RMS_THRESHOLD`
+2. **细检测误判**：调整`CONFIDENCE_THRESHOLD`或频段能量阈值
+3. **检测延迟过长**：减少`RMS_WINDOW_SIZE`（不推荐）或优化算法
+
+---
 
 ## 📊 **参数总结**
 

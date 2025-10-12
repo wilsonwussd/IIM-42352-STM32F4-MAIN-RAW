@@ -873,7 +873,7 @@ static void MX_GPIO_Init(void)
 
   /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(CSB_GPIO_Port, CSB_Pin, GPIO_PIN_SET);
-  HAL_GPIO_WritePin(GPIOE, GPIO_PIN_14, GPIO_PIN_SET);  /* Set PE14 to HIGH */
+  HAL_GPIO_WritePin(GPIOE, GPIO_PIN_14, GPIO_PIN_RESET);  /* Set PE14 to LOW (LoRa power off for low power) */
 
   /*Configure GPIO pin : CSB_Pin */
   GPIO_InitStruct.Pin = CSB_Pin;
@@ -1504,6 +1504,10 @@ void Process_Alarm_State_Machine(void)
                 #endif
             } else if ((HAL_GetTick() - lora_timeout_start_time) > LORA_TIMEOUT_MS) {
                 printf("Timeout waiting for response to set 1\n");
+
+                // Power off LoRa module on timeout
+                LoRa_Power_Off();
+
                 alarm_state = ALARM_STATE_IDLE;
                 Send_Response_To_PC("ALARM_SET_TIMEOUT");
 
@@ -1551,6 +1555,10 @@ void Process_Alarm_State_Machine(void)
                 #endif
             } else if ((HAL_GetTick() - lora_timeout_start_time) > LORA_TIMEOUT_MS) {
                 printf("Timeout waiting for response to set 0\n");
+
+                // Power off LoRa module on timeout
+                LoRa_Power_Off();
+
                 alarm_state = ALARM_STATE_IDLE;
                 Send_Response_To_PC("ALARM_RESET_TIMEOUT");
 
@@ -1563,6 +1571,10 @@ void Process_Alarm_State_Machine(void)
 
         case ALARM_STATE_COMPLETE:
             printf("Alarm cycle completed successfully\n");
+
+            // Power off LoRa module to save power
+            LoRa_Power_Off();
+
             alarm_state = ALARM_STATE_IDLE;
             Send_Response_To_PC("ALARM_CYCLE_COMPLETE");
             break;
@@ -1573,11 +1585,55 @@ void Process_Alarm_State_Machine(void)
 }
 
 /**
+ * @brief Turn on LoRa module power (PE14 = HIGH)
+ */
+void LoRa_Power_On(void)
+{
+    if (!LoRa_Is_Power_On()) {
+        printf("LoRa: Powering ON (PE14 = HIGH)...\n");
+        HAL_GPIO_WritePin(LORA_POWER_PORT, LORA_POWER_PIN, GPIO_PIN_SET);
+
+        // Wait for LoRa module to startup and establish connection
+        printf("LoRa: Waiting %dms for module startup and connection...\n", LORA_STARTUP_DELAY_MS);
+        HAL_Delay(LORA_STARTUP_DELAY_MS);
+
+        printf("LoRa: Power ON complete, ready to communicate\n");
+    } else {
+        printf("LoRa: Already powered ON\n");
+    }
+}
+
+/**
+ * @brief Turn off LoRa module power (PE14 = LOW)
+ */
+void LoRa_Power_Off(void)
+{
+    if (LoRa_Is_Power_On()) {
+        printf("LoRa: Powering OFF (PE14 = LOW) for low power mode\n");
+        HAL_GPIO_WritePin(LORA_POWER_PORT, LORA_POWER_PIN, GPIO_PIN_RESET);
+    } else {
+        printf("LoRa: Already powered OFF\n");
+    }
+}
+
+/**
+ * @brief Check if LoRa module is powered on
+ * @return 1 if powered on, 0 if powered off
+ */
+uint8_t LoRa_Is_Power_On(void)
+{
+    return (HAL_GPIO_ReadPin(LORA_POWER_PORT, LORA_POWER_PIN) == GPIO_PIN_SET) ? 1 : 0;
+}
+
+/**
  * @brief Trigger alarm cycle
  */
 void Trigger_Alarm_Cycle(void)
 {
     if (alarm_state == ALARM_STATE_IDLE) {
+        // Power on LoRa module before sending alarm
+        LoRa_Power_On();
+
         alarm_state = ALARM_STATE_SET_1;
         printf("Alarm cycle triggered\n");
     } else {
