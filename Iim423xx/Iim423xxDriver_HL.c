@@ -721,12 +721,44 @@ int inv_iim423xx_get_data_from_fifo(struct inv_iim423xx * s)
 		return status;
 
 	if((int_status & BIT_INT_STATUS_FIFO_THS) || (int_status & BIT_INT_STATUS_FIFO_FULL)) {
-		
+
 		/* FIFO record mode configured at driver init, so we read packet number, not byte count */
 		status |= inv_iim423xx_read_reg(s, MPUREG_FIFO_COUNTH, 2, data);
 		if(status != INV_ERROR_SUCCESS)
 			return status;
 		inv_iim423xx_format_data(IIM423XX_INTF_CONFIG0_DATA_LITTLE_ENDIAN, data, &packet_count);
+
+		// 调试：统计FIFO packet数量分布
+		static uint32_t fifo_packet_stats[11] = {0}; // 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10+
+		static uint32_t fifo_read_count = 0;
+		if (packet_count <= 10) {
+			fifo_packet_stats[packet_count]++;
+		} else {
+			fifo_packet_stats[10]++;
+		}
+		fifo_read_count++;
+
+		// 每100次FIFO读取打印一次统计
+		if (fifo_read_count == 100) {
+			printf("FIFO_STATS: Packet distribution over 100 reads:\r\n");
+			for (int i = 0; i <= 10; i++) {
+				if (fifo_packet_stats[i] > 0) {
+					if (i == 10) {
+						printf("  10+ packets: %lu times (%.1f%%)\r\n",
+							   fifo_packet_stats[i], fifo_packet_stats[i] * 100.0f / 100);
+					} else {
+						printf("  %d packet%s: %lu times (%.1f%%)\r\n",
+							   i, i == 1 ? " " : "s",
+							   fifo_packet_stats[i], fifo_packet_stats[i] * 100.0f / 100);
+					}
+				}
+			}
+			// 重置统计
+			for (int i = 0; i <= 10; i++) {
+				fifo_packet_stats[i] = 0;
+			}
+			fifo_read_count = 0;
+		}
 
 		if (packet_count > 0) {
 			/* Read FIFO only when data is expected in FIFO */

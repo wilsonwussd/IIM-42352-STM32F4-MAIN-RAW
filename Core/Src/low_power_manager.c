@@ -1363,22 +1363,141 @@ int LowPower_WOM_SwitchToLNMode(void)
         return -4;
     }
 
-    // 关键步骤3：使能DATA_RDY中断
-    printf("WOM: Configuring DATA_RDY interrupt for LN mode...\r\n");
-    uint8_t int_source0 = BIT_INT_SOURCE0_UI_DRDY_INT1_EN;
+    // 关键步骤2.5：重新配置FIFO以确保每个样本都触发中断
+    // 问题：默认FIFO配置导致中断频率只有200Hz而不是1000Hz
+    // 关键发现：需要检查INTF_CONFIG0的FIFO_COUNT_REC位来确定水印单位
+    printf("WOM: Reconfiguring FIFO for 1000Hz interrupt rate...\r\n");
+
+    // 首先检查INTF_CONFIG0寄存器，确定FIFO计数模式
+    uint8_t intf_config0 = 0;
+    rc = inv_iim423xx_read_reg(&icm_driver, MPUREG_INTF_CONFIG0, 1, &intf_config0);
+    if (rc == 0) {
+        bool is_packet_mode = (intf_config0 & BIT_FIFO_COUNT_REC_MASK) != 0;
+        printf("WOM:   INTF_CONFIG0 = 0x%02X (FIFO_COUNT_REC=%s)\r\n",
+               intf_config0, is_packet_mode ? "PACKET" : "BYTE");
+
+        // 如果不是packet模式，强制设置为packet模式
+        if (!is_packet_mode) {
+            printf("WOM:   Switching to PACKET mode...\r\n");
+            intf_config0 |= (uint8_t)IIM423XX_INTF_CONFIG0_FIFO_COUNT_REC_RECORD;
+            rc = inv_iim423xx_write_reg(&icm_driver, MPUREG_INTF_CONFIG0, 1, &intf_config0);
+            if (rc != 0) {
+                printf("WOM: ERROR - Failed to set FIFO packet mode: %d\r\n", rc);
+                return -4;
+            }
+        }
+    }
+
+    // 重新启用FIFO（确保使用STOP_ON_FULL模式）
+    uint8_t fifo_mode = IIM423XX_FIFO_CONFIG_MODE_STOP_ON_FULL;  // 0x80
+    rc = inv_iim423xx_write_reg(&icm_driver, MPUREG_FIFO_CONFIG, 1, &fifo_mode);
+    if (rc != 0) {
+        printf("WOM: ERROR - Failed to configure FIFO mode: %d\r\n", rc);
+        return -4;
+    }
+
+    // 设置FIFO水印为1（在packet模式下，1 = 1个packet）
+    uint16_t watermark = 1;
+    rc = inv_iim423xx_write_reg(&icm_driver, MPUREG_FIFO_CONFIG2, 2, (uint8_t *)&watermark);
+    if (rc != 0) {
+        printf("WOM: ERROR - Failed to set FIFO watermark: %d\r\n", rc);
+        return -4;
+    }
+
+    // 验证FIFO配置
+    rc = inv_iim423xx_read_reg(&icm_driver, MPUREG_FIFO_CONFIG, 1, &reg_value);
+    if (rc == 0) {
+        printf("WOM:   FIFO_CONFIG = 0x%02X (0x80 = STOP_ON_FULL)\r\n", reg_value);
+    }
+
+    // 读取并验证FIFO水印
+    uint8_t wm_bytes[2];
+    rc = inv_iim423xx_read_reg(&icm_driver, MPUREG_FIFO_CONFIG2, 2, wm_bytes);
+    if (rc == 0) {
+        uint16_t wm_read = wm_bytes[0] | (wm_bytes[1] << 8);
+        printf("WOM:   FIFO_WM = %u (in packet mode: 1 = 1 packet)\r\n", wm_read);
+    }
+
+    // 关键修复：配置FIFO_CONFIG1寄存器，启用FIFO_WM_GT_TH位
+    // 这是问题的根本原因！FIFO_WM_GT_TH=1时，每次ODR都会检查水印并触发中断
+    // 如果FIFO_WM_GT_TH=0（默认），只在第一次达到水印时触发一次中断
+    printf("WOM: Configuring FIFO_CONFIG1 for continuous watermark interrupts...\r\n");
+
+    uint8_t fifo_config1 = 0;
+    rc = inv_iim423xx_read_reg(&icm_driver, MPUREG_FIFO_CONFIG1, 1, &fifo_config1);
+    if (rc == 0) {
+        printf("WOM:   FIFO_CONFIG1 current = 0x%02X\r\n", fifo_config1);
+
+        // 设置必要的位：
+        // Bit 5: FIFO_WM_GT_TH = 1 (每次ODR检查水印)
+        // Bit 3: FIFO_TMST_FSYNC_EN = 1 (时间戳)
+        // Bit 2: FIFO_TEMP_EN = 1 (温度)
+        // Bit 0: FIFO_ACCEL_EN = 1 (加速度计)
+        fifo_config1 |= (uint8_t)IIM423XX_FIFO_CONFIG1_WM_GT_TH_EN;      // 0x20
+        fifo_config1 |= (uint8_t)IIM423XX_FIFO_CONFIG1_TMST_FSYNC_EN;   // 0x08
+        fifo_config1 |= (uint8_t)IIM423XX_FIFO_CONFIG1_TEMP_EN;         // 0x04
+        fifo_config1 |= (uint8_t)IIM423XX_FIFO_CONFIG1_ACCEL_EN;        // 0x01
+
+        rc = inv_iim423xx_write_reg(&icm_driver, MPUREG_FIFO_CONFIG1, 1, &fifo_config1);
+        if (rc != 0) {
+            printf("WOM: ERROR - Failed to configure FIFO_CONFIG1: %d\r\n", rc);
+            return -4;
+        }
+
+        // 验证配置
+        rc = inv_iim423xx_read_reg(&icm_driver, MPUREG_FIFO_CONFIG1, 1, &reg_value);
+        if (rc == 0) {
+            printf("WOM:   FIFO_CONFIG1 new = 0x%02X (expected: 0x2D)\r\n", reg_value);
+            printf("WOM:   FIFO_WM_GT_TH = %d (should be 1 for continuous interrupts)\r\n",
+                   (reg_value & BIT_FIFO_CONFIG1_WM_GT_TH_MASK) >> BIT_FIFO_CONFIG1_WM_GT_TH_POS);
+        }
+    }
+
+    // 关键步骤3：启用FIFO水印中断（而不是DATA_RDY中断）
+    // 原因：使用FIFO模式时，应该使用FIFO_THS中断，而不是DATA_RDY中断
+    printf("WOM: Enabling FIFO watermark interrupt for LN mode...\r\n");
+
+    // 首先禁用DATA_RDY中断（FIFO模式下不需要）
+    uint8_t int_source0 = 0x00;  // 禁用所有INT_SOURCE0中断
     rc = inv_iim423xx_write_reg(&icm_driver, MPUREG_INT_SOURCE0, 1, &int_source0);
     if (rc != 0) {
-        printf("WOM: ERROR - Failed to enable DATA_RDY interrupt: %d\r\n", rc);
+        printf("WOM: ERROR - Failed to disable DATA_RDY interrupt: %d\r\n", rc);
         return -5;
     }
 
-    // 验证INT_SOURCE0配置
+    // 启用FIFO水印中断（使用驱动提供的函数）
+    inv_iim423xx_interrupt_parameter_t int_config;
+    rc = inv_iim423xx_get_config_int1(&icm_driver, &int_config);
+    if (rc != 0) {
+        printf("WOM: ERROR - Failed to get INT1 config: %d\r\n", rc);
+        return -5;
+    }
+
+    // 启用FIFO_THS中断
+    int_config.INV_IIM423XX_FIFO_THS = INV_IIM423XX_ENABLE;
+    int_config.INV_IIM423XX_UI_DRDY = INV_IIM423XX_DISABLE;  // 确保DATA_RDY禁用
+
+    rc = inv_iim423xx_set_config_int1(&icm_driver, &int_config);
+    if (rc != 0) {
+        printf("WOM: ERROR - Failed to enable FIFO_THS interrupt: %d\r\n", rc);
+        return -5;
+    }
+
+    printf("WOM:   FIFO_THS interrupt enabled, DATA_RDY interrupt disabled\r\n");
+
+    // 验证INT_SOURCE0配置（应该为0x04，表示FIFO_THS中断启用）
     rc = inv_iim423xx_read_reg(&icm_driver, MPUREG_INT_SOURCE0, 1, &reg_value);
     if (rc == 0) {
-        printf("WOM:   INT_SOURCE0 = 0x%02X (expected: 0x08)\r\n", reg_value);
-        if (reg_value != BIT_INT_SOURCE0_UI_DRDY_INT1_EN) {
-            printf("WOM: WARNING - INT_SOURCE0 verification failed!\r\n");
+        printf("WOM:   INT_SOURCE0 = 0x%02X (0x04 = FIFO_THS enabled)\r\n", reg_value);
+        if (reg_value != 0x04) {
+            printf("WOM: WARNING - INT_SOURCE0 should be 0x04 for FIFO_THS interrupt!\r\n");
         }
+    }
+
+    // 额外调试：读取INT_CONFIG1寄存器，检查中断配置
+    rc = inv_iim423xx_read_reg(&icm_driver, MPUREG_INT_CONFIG1, 1, &reg_value);
+    if (rc == 0) {
+        printf("WOM:   INT_CONFIG1 = 0x%02X\r\n", reg_value);
     }
 
     // 验证ACCEL_CONFIG0
